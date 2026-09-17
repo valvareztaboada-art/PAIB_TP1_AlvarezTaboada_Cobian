@@ -1,0 +1,111 @@
+[workspace]
+name = "napari-advanced-class-multiplataforma"
+channels = ["conda-forge"]
+platforms = ["linux-64", "win-64", "osx-64", "osx-arm64"]
+
+[tasks]
+napari = "napari"
+python = "python"
+
+# Chequeos principales para clase
+check = "python -c \"import napari, numpy, scipy, skimage, sklearn, matplotlib, pywt, cv2, pandas; print('ENTORNO BASE OK')\""
+check-ft = "python -c \"import napari_ft; print('napari-ft OK')\""
+check-dl = "python -c \"import torch, torchvision; print('PYTORCH OK', torch.__version__, 'CUDA disponible:', torch.cuda.is_available())\""
+check-yolo = "python -c \"from ultralytics import YOLO; print('YOLO / ultralytics OK')\""
+check-widgets = "python -c \"import napari, magicgui, numpy, scipy, skimage, sklearn, matplotlib, pywt, cv2, pandas, torch, torchvision; from ultralytics import YOLO; print('WIDGETS DOCENTES OK')\""
+qt-debug = "python -c \"from qtpy.QtWidgets import QApplication; app = QApplication([]); print('QT OK')\""
+
+# Instalaciones opcionales: NO se ejecutan durante pixi install.
+# Usarlas solo si el entorno base ya abrió napari correctamente.
+install-plugin-manager = "python -m pip install napari-plugin-manager"
+install-czi-reader = "python -m pip install napari-czifile2"
+install-aicsimageio = "python -m pip install napari-aicsimageio"
+install-nikon-nd2 = "python -m pip install napari-nikon-nd2 nd2-dask"
+install-cellpose = "python -m pip install cellpose-napari"
+install-extra-processing = "python -m pip install napari-simpleitk-image-processing napari-segment-blobs-and-things-with-membranes"
+
+[dependencies]
+# Python 3.10 es una opción conservadora para napari + PyTorch + plugins docentes.
+python = ">=3.10,<3.11"
+
+# napari moderno pero sin saltar a cambios mayores de la serie 0.6
+napari = ">=0.5,<0.6"
+
+# Backend Qt multiplataforma. PySide6 resolvió correctamente en tu entorno.
+pyside6 = ">=6,<7"
+qtpy = "*"
+
+# Procesamiento y análisis numérico para los widgets propios
+numpy = "*"
+scipy = "*"
+scikit-image = "*"
+scikit-learn = "*"
+pandas = "*"
+matplotlib = "*"
+statsmodels = "*"
+pywavelets = "*"
+pyfftw = "*"
+opencv = "*"
+imageio = "*"
+tifffile = "*"
+pillow = "*"
+tqdm = "*"
+pyyaml = "*"
+
+# Interacción / notebooks / datos grandes
+ipython = "*"
+jupyter = "*"
+magicgui = "*"
+dask = "*"
+zarr = "*"
+
+# SimpleITK como librería de procesamiento, no como plugin napari obligatorio
+simpleitk = "*"
+
+# Plugins livianos y útiles para la clase
+napari-matplotlib = "*"
+napari-crop = "*"
+
+# ML / DL: se mantienen porque los necesitás para los widgets de modelos, U-Net/Grad-CAM/YOLO.
+# En conda-forge el paquete se llama pytorch, pero en Python se importa como torch.
+pytorch = ">=2,<3"
+torchvision = ">=0.17,<1"
+ultralytics = ">=8,<9"
+
+[pypi-dependencies]
+# Plugins livianos instalados por PyPI.
+napari-ft = "==0.1.0"
+napari-plot-profile = "*"
+
+# No dejar como obligatorios:
+# cellpose-napari
+# napari-plugin-manager
+# napari-czifile2
+# napari-nikon-nd2
+# napari-aicsimageio
+# napari-simpleitk-image-processing
+# napari-segment-blobs-and-things-with-membranes
+# napari-metroid
+# napari-ndev
+
+# Dependencias Linux/XCB: SOLO para linux-64, no para macOS ni Windows.
+[target.linux-64.dependencies]
+libxcb = "*"
+xcb-util-cursor = "*"
+xcb-util-image = "*"
+xcb-util-keysyms = "*"
+xcb-util-renderutil = "*"
+xcb-util-wm = "*"
+libxkbcommon = "*"
+xorg-libx11 = "*"
+xorg-libxext = "*"
+xorg-libxrender = "*"
+xorg-libsm = "*"
+xorg-libice = "*"
+libgl = "*"
+
+[target.linux-64.tasks]
+# En Linux, usar XCB explícitamente suele ser más estable para clase.
+napari = "QT_QPA_PLATFORM=xcb napari"
+napari-wayland = "QT_QPA_PLATFORM=wayland napari"
+qt-debug-verbose = "QT_DEBUG_PLUGINS=1 python -c \"from qtpy.QtWidgets import QApplication; app = QApplication([]); print('QT OK')\""
