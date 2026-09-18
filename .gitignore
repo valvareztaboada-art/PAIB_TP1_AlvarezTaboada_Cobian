@@ -1,14 +1,12 @@
 # ============================================================
 # Pixi
 # ============================================================
-# El entorno local generado y sus lockfiles NO se versionan.
-# La fuente de verdad es pixi_multiplataforma.toml (ese SÍ se sube).
-# Cada uno regenera su entorno con:
-#   cp pixi_multiplataforma.toml pixi.toml  (Copy-Item en Windows)
+# pixi.toml y pixi.lock SÍ se versionan: el lock fija las versiones
+# exactas (para linux, windows y mac) y así todos tenemos el mismo
+# entorno. Solo se ignora el entorno instalado (.pixi/, pesa varios GB).
+# Cada uno lo regenera con:
 #   pixi install
 .pixi/
-pixi.toml
-pixi.lock
 
 # ============================================================
 # Python
@@ -21,15 +19,6 @@ __pycache__/
 venv/
 env/
 
-# ============================================================
-# Resultados generados
-# ============================================================
-# Ojo: el CSV final y las imágenes procesadas son entregables del TP,
-# así que por defecto NO los ignoramos. Si quieren dejar de versionar
-# salidas intermedias, descomenten lo de abajo.
-# resultados/*.csv
-# resultados/*.png
-# resultados/*.tif
 
 # ============================================================
 # Editores / Sistema operativo

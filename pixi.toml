@@ -56,7 +56,7 @@ pyyaml = "*"
 ipython = "*"
 jupyter = "*"
 magicgui = "*"
-dask = "*"
+dask = ">=2024.8"   # dask viejo (2023.x) rompe napari con NumPy 2
 zarr = "*"
 
 # SimpleITK como librería de procesamiento, no como plugin napari obligatorio

@@ -34,7 +34,7 @@ El widget abarca:
 | Archivo / carpeta            | Descripción                                                       |
 | ---------------------------- | ---------------------------------------------------------------- |
 | `widget_tp1.py`              | Widget principal de napari con el pipeline de procesamiento       |
-| `pixi_multiplataforma.toml`  | Definición del entorno reproducible (Python, napari, librerías)   |
+| `pixi.toml` / `pixi.lock`    | Entorno reproducible (Python, napari, librerías) y versiones fijas |
 | `data/`                      | Imágenes de retina utilizadas en el trabajo                       |
 | `resultados/`                | CSV de resultados e imágenes procesadas                          |
 
@@ -56,21 +56,14 @@ macOS / Linux:
 curl -fsSL https://pixi.sh/install.sh | sh
 ```
 
-**2. Crear el entorno** (desde la carpeta del proyecto).
-
-Windows (PowerShell):
-
-```powershell
-Copy-Item pixi_multiplataforma.toml pixi.toml -Force
-pixi install
-```
-
-macOS / Linux:
+**2. Crear el entorno** (desde la carpeta del proyecto, cualquier sistema operativo):
 
 ```bash
-cp pixi_multiplataforma.toml pixi.toml
 pixi install
 ```
+
+`pixi.toml` y `pixi.lock` están versionados: el lock fija las versiones exactas
+para Linux, Windows y macOS, así todos obtienen el mismo entorno.
 
 **3. Ejecutar el widget:**
 
@@ -87,7 +80,7 @@ panel del TP para el análisis y procesamiento.
 
 - Widget funcional de napari (`widget_tp1.py`).
 - Código organizado en funciones.
-- Entorno reproducible (`pixi_multiplataforma.toml`).
+- Entorno reproducible (`pixi.toml` / `pixi.lock`).
 - CSV de resultados (`resultados/`).
 - Imágenes obtenidas.
 - Informe breve de análisis y justificación de las decisiones tomadas.
