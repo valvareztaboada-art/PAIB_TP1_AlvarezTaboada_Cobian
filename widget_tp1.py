@@ -53,7 +53,7 @@ from matplotlib.backends.backend_qtagg import (
     NavigationToolbar2QT,
 )
 from napari.layers import Image, Shapes
-from qtpy.QtWidgets import QVBoxLayout, QWidget
+from qtpy.QtWidgets import QScrollArea, QVBoxLayout, QWidget
 from skimage.draw import polygon
 from skimage.measure import profile_line
 
@@ -1322,26 +1322,56 @@ def guardar_resultados_actuales():
 # 9. PANEL LATERAL
 # ============================================================
 
+def titulo(texto):
+    """Encabezado de sección del panel."""
+    etiqueta = Label(value=texto)
+    etiqueta.native.setStyleSheet("font-weight: bold; margin-top: 8px;")
+    return etiqueta
+
+
+# labels=False: sin la columna con los nombres internos de cada bloque
+# (widget_gris, widget_pipeline...), que ensanchaba mucho el panel.
 panel = Container(
+    labels=False,
     widgets=[
+        titulo("ROIs"),
         boton_crear_roi,
+        titulo("Escala de grises"),
         widget_gris,
+        titulo("Medición (media / varianza / MAD)"),
         widget_medicion,
+        titulo("Actividad 1 - Diagnóstico"),
         boton_crear_perfil,
         widget_diagnostico,
+        titulo("Registro del pipeline"),
         widget_pipeline,
         informe,
+        titulo("Archivo CSV"),
         ruta_csv,
         boton_guardar_csv,
         estado_csv,
     ]
 )
 
+# El panel va dentro de un QScrollArea: si no entra en la pantalla
+# aparece una barra de desplazamiento y no se tapan los botones.
+panel_con_scroll = QScrollArea()
+panel_con_scroll.setWidgetResizable(True)
+panel_con_scroll.setWidget(panel.native)
+panel_con_scroll.setMinimumWidth(panel.native.sizeHint().width() + 30)
+
 viewer.window.add_dock_widget(
-    panel,
+    panel_con_scroll,
     area="right",
     name="TP1 - Preprocesamiento",
 )
+
+# Al estar dentro del QScrollArea, magicgui no detecta solo el visor:
+# se refrescan a mano las listas de capas (Image / Shapes) de los widgets.
+viewer.layers.events.inserted.connect(panel.reset_choices)
+viewer.layers.events.removed.connect(panel.reset_choices)
+viewer.layers.events.moved.connect(panel.reset_choices)
+panel.reset_choices()
 
 
 # ============================================================
