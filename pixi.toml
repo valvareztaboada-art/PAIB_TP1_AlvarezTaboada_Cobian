@@ -76,6 +76,7 @@ ultralytics = ">=8,<9"
 # Plugins livianos instalados por PyPI.
 napari-ft = "==0.1.0"
 napari-plot-profile = "*"
+bm3d = ">=4, <5"
 
 # No dejar como obligatorios:
 # cellpose-napari
