@@ -8,42 +8,50 @@
 # Flujo de trabajo del TP:
 #   diagnosticar -> estimar -> seleccionar -> procesar -> evaluar
 #
-# ------------------------------------------------------------
-# ESTADO: ACTIVIDADES 1, 2 Y 3 IMPLEMENTADAS.
-#
-# Lo que YA funciona:
-#   - abrir napari con el panel del TP;
-#   - convertir la imagen (o el recorte de una ROI) a escala de grises 2D;
-#   - crear una capa de ROIs, etiquetar cada ROI con su segmento
-#     (fondo, vaso, disco...) y medir media/varianza/desv/MAD en una
-#     o en todas las ROIs;
-#   - Actividad 1: diagnóstico (histogramas global/regional, perfiles,
-#     variabilidad local, diferencias, FFT, autocorrelación, wavelet)
-#     sobre la imagen completa o una ROI;
-#   - Actividad 2: estimación de σ del ruido (ROI homogénea con media
-#     observada o fija, múltiples ROIs, MAD, diferencias entre
-#     adquisiciones, diferencias locales, wavelet);
-#   - Actividad 3: reducción de ruido (gaussiano, bilateral, difusión
-#     anisotrópica, NLM, TV, wavelet thresholding, Wiener local, BM3D)
-#     con parámetros elegidos por el usuario; el resultado es una capa
-#     nueva que puede seguir en el pipeline;
-#   - todas las mediciones y los pasos del pipeline van al MISMO CSV
-#     acumulativo, con la región y la etiqueta de la ROI (Act. 7).
-#
-# El widget solo calcula valores: la hipótesis de la degradación
-# dominante, la justificación de la estimación y la elección de
-# parámetros se hacen en el informe, a partir de esos valores.
-#
-# Lo que hay que COMPLETAR (marcado con  # >>> ACÁ COMPLETAMOS ):
-#   - Actividad 4: restauración (deconvolución) y filtros notch
-#   - Actividad 5: corrección de fondo
-#   - Actividad 6: realce
-#   - Actividad 7: métricas con y sin referencia
-#
 # Correr con:   pixi run python widget_tp1.py
+#
+# ------------------------------------------------------------
+# CÓMO ESTÁ ORGANIZADO ESTE ARCHIVO
+#
+#   1. Helpers base: estadísticas, ROIs, escala de grises, recortes.
+#   2. CSV acumulativo: una sola planilla con TODAS las filas
+#      (mediciones y pasos del pipeline), distinguidas por las
+#      columnas actividad / region / etiqueta_roi.
+#   3. Funciones del pipeline (una sección por actividad del TP).
+#      Son funciones puras: reciben una imagen 2D (np.ndarray) y
+#      devuelven valores o imágenes, sin tocar la interfaz:
+#        Act. 1  diagnosticar()        histogramas, perfiles, MAD,
+#                                      variabilidad, FFT, wavelet
+#        Act. 2  estimar_ruido()       ROI homogénea, múltiples ROIs,
+#                                      MAD, adquisiciones, dif. locales,
+#                                      coeficientes wavelet
+#        Act. 3  reducir_ruido()       gaussiano, bilateral, difusión
+#                                      anisotrópica, NLM, TV, wavelet,
+#                                      Wiener local, BM3D
+#        Act. 4  restaurar()           deconvolución Wiener / RL con PSF
+#                aplicar_notch()       artefactos periódicos en Fourier
+#        Act. 5  corregir_fondo()      dark/flat, kernel grande, rolling
+#                                      ball, top-hat, homomórfica
+#        Act. 6  realzar()             gamma, log, sigmoidal, CLAHE,
+#                                      pasa-altos, pasa-banda, unsharp
+#        Act. 7  evaluar()             SNR, CNR, uniformidad (sin
+#                                      referencia); MSE, PSNR, SSIM
+#   4-5. Visor, estado y capa de ROIs (cada ROI puede etiquetarse con
+#        el segmento que representa: fondo, vaso, disco...).
+#   6. Un widget por actividad (secciones 6.1 a 6.8). Cada uno arma la
+#      región a procesar, llama a la función pura, crea las capas
+#      resultantes, muestra una figura y carga su fila al CSV.
+#   7-8. Registro manual del pipeline y controles del CSV.
+#   9-10. Panel lateral (con scroll), panel fijo del informe e inicio.
+#
+# CRITERIO: el widget calcula y muestra valores; no decide. La
+# hipótesis de la degradación dominante, la justificación de cada
+# estimación y la elección de los parámetros se hacen en el informe
+# del TP, leyendo esos valores.
 # ============================================================
 
 import csv
+from itertools import combinations
 from pathlib import Path
 from datetime import datetime
 
@@ -52,7 +60,7 @@ import napari
 import numpy as np
 import pywt
 from scipy import ndimage as ndi
-from scipy.signal import wiener
+from scipy.signal import fftconvolve, wiener
 
 from magicgui import magicgui
 from magicgui.widgets import (
@@ -63,6 +71,7 @@ from magicgui.widgets import (
     TextEdit,
 )
 from matplotlib.figure import Figure
+from matplotlib.patches import Circle
 from matplotlib.backends.backend_qtagg import (
     FigureCanvasQTAgg,
     NavigationToolbar2QT,
@@ -70,12 +79,18 @@ from matplotlib.backends.backend_qtagg import (
 from napari.layers import Image, Shapes
 from qtpy.QtWidgets import QScrollArea, QVBoxLayout, QWidget
 from skimage.draw import polygon
+from skimage.exposure import equalize_adapthist
 from skimage.measure import profile_line
+from skimage.metrics import structural_similarity
+from skimage.morphology import disk, white_tophat
 from skimage.restoration import (
     denoise_nl_means,
+    rolling_ball,
     denoise_tv_chambolle,
     denoise_wavelet,
+    unsupervised_wiener,
 )
+from skimage.restoration import wiener as wiener_deconv
 
 
 # ============================================================
@@ -1058,9 +1073,315 @@ def reducir_ruido(imagen, metodo="Gaussiano", escala=255.0, **p):
 # Actividad 4 - Restauración y artefactos
 # (deconvolución Wiener / Richardson-Lucy; filtro notch en Fourier)
 # ------------------------------------------------------------
-def restaurar(imagen, metodo="wiener", **kwargs):
-    # >>> ACÁ COMPLETAMOS: deconvolución con PSF / notch para artefactos periódicos
-    raise NotImplementedError("Actividad 4: restauración sin implementar.")
+#
+# 4.a  PSF y deconvolución
+#      La PSF puede sintetizarse (gaussiana, disco, movimiento) o venir
+#      de una capa de napari (PSF medida o provista por la cátedra).
+
+TIPOS_PSF = ["Gaussiana", "Disco (desenfoque)", "Movimiento lineal", "Capa de napari"]
+METODOS_DECONVOLUCION = ["Wiener", "Wiener no supervisado", "Richardson-Lucy"]
+
+
+def psf_gaussiana(sigma=2.0):
+    """PSF gaussiana isótropa de desvío sigma (px)."""
+    if sigma <= 0:
+        raise ValueError("El sigma de la PSF debe ser positivo.")
+    radio = int(np.ceil(3 * sigma))
+    y, x = np.mgrid[-radio:radio + 1, -radio:radio + 1]
+    psf = np.exp(-(x ** 2 + y ** 2) / (2 * sigma ** 2))
+    return psf / psf.sum()
+
+
+def psf_disco(radio=3.0):
+    """PSF de disco (desenfoque por apertura circular)."""
+    if radio <= 0:
+        raise ValueError("El radio de la PSF debe ser positivo.")
+    r = int(np.ceil(radio))
+    y, x = np.mgrid[-r:r + 1, -r:r + 1]
+    psf = (np.hypot(x, y) <= radio).astype(float)
+    return psf / psf.sum()
+
+
+def psf_movimiento(longitud=9.0, angulo=0.0):
+    """PSF de movimiento lineal: un segmento de `longitud` px a `angulo` grados."""
+    if longitud < 2:
+        raise ValueError("La longitud de la PSF debe ser de al menos 2 px.")
+    radio = int(np.ceil(longitud / 2))
+    psf = np.zeros((2 * radio + 1, 2 * radio + 1))
+    theta = np.deg2rad(angulo)
+    pasos = np.linspace(-longitud / 2, longitud / 2, int(4 * longitud))
+    filas = np.round(radio - pasos * np.sin(theta)).astype(int)
+    columnas = np.round(radio + pasos * np.cos(theta)).astype(int)
+    np.add.at(psf, (filas, columnas), 1.0)
+    return psf / psf.sum()
+
+
+def psf_desde_datos(datos):
+    """PSF a partir de una capa: pasa a gris, recorta negativos y normaliza."""
+    psf = a_escala_de_grises(datos)
+    psf = np.clip(psf - psf.min(), 0, None)
+    total = psf.sum()
+    if total <= 0:
+        raise ValueError("La capa elegida como PSF está vacía.")
+    return psf / total
+
+
+def construir_psf(tipo, sigma_psf=2.0, radio_psf=3.0, longitud_psf=9.0,
+                  angulo_psf=0.0, datos_psf=None):
+    if tipo == "Gaussiana":
+        return psf_gaussiana(sigma_psf)
+    if tipo == "Disco (desenfoque)":
+        return psf_disco(radio_psf)
+    if tipo == "Movimiento lineal":
+        return psf_movimiento(longitud_psf, angulo_psf)
+    if tipo == "Capa de napari":
+        if datos_psf is None:
+            raise ValueError("Elegí la capa que contiene la PSF.")
+        return psf_desde_datos(datos_psf)
+    raise ValueError(f"Tipo de PSF desconocido: {tipo}")
+
+
+def _con_borde(img, ancho):
+    """Extiende los bordes (evita el anillado de la convolución circular)."""
+    return np.pad(img, ancho, mode="edge")
+
+
+def _sin_borde(img, ancho):
+    return img[ancho:-ancho, ancho:-ancho] if ancho > 0 else img
+
+
+def deconvolucion_wiener(img, psf, balance=0.01, escala=255.0, no_supervisado=False):
+    """
+    Deconvolución de Wiener: U = (H* / (|H|² + balance·|R|²)) · F.
+    `balance` es la regularización: es el peso del término que penaliza las
+    altas frecuencias. Un valor del orden de NSR = σ²/Var(imagen) equilibra
+    resolución y ruido; más chico afina pero amplifica el ruido.
+    "No supervisado" estima esa regularización con un muestreo bayesiano
+    (skimage.restoration.unsupervised_wiener) en vez de fijarla a mano.
+    """
+    ancho = max(psf.shape) // 2 + 1
+    extendida = _con_borde(np.asarray(img, dtype=float) / escala, ancho)
+
+    if no_supervisado:
+        salida, _ = unsupervised_wiener(extendida, psf, clip=False)
+        usado = None
+    else:
+        if balance <= 0:
+            raise ValueError("El balance (regularización) debe ser positivo.")
+        salida = wiener_deconv(extendida, psf, balance=balance, clip=False)
+        usado = balance
+
+    return _sin_borde(np.asarray(salida, dtype=float), ancho) * escala, usado
+
+
+def richardson_lucy(img, psf, iteraciones=20, tolerancia=0.0, escala=255.0):
+    """
+    Richardson-Lucy: iteración multiplicativa que supone ruido de Poisson.
+      u_{k+1} = u_k · [ (f / (u_k * h)) * h⁻ ]
+    Devuelve (imagen, historial). En cada iteración se registra:
+      - residuo_rms: RMS de f - (u_k * h), el ajuste a los datos observados;
+      - cambio: ||u_k - u_{k-1}|| / ||u_{k-1}||, cuánto se mueve la solución.
+    RL no converge a algo estable: amplifica el ruido a partir de cierta
+    iteración, así que hace falta un criterio de parada. Con tolerancia > 0
+    se corta cuando el cambio relativo baja de ese valor.
+    """
+    psf = np.asarray(psf, dtype=float)
+    psf_espejo = psf[::-1, ::-1]
+    ancho = max(psf.shape) // 2 + 1
+    f = _con_borde(np.asarray(img, dtype=float) / escala, ancho)
+
+    u = np.full(f.shape, f.mean())
+    historial = []
+    eps = 1e-12
+
+    for k in range(1, int(iteraciones) + 1):
+        convolucion = fftconvolve(u, psf, mode="same")
+        u_previo = u
+        u = u * fftconvolve(f / (convolucion + eps), psf_espejo, mode="same")
+        u = np.clip(u, 0, None)
+
+        cambio = float(
+            np.linalg.norm(u - u_previo) / max(np.linalg.norm(u_previo), eps)
+        )
+        historial.append({
+            "iteracion": k,
+            "residuo_rms": float(np.sqrt(np.mean((f - convolucion) ** 2)) * escala),
+            "cambio": cambio,
+        })
+        if tolerancia > 0 and cambio < tolerancia:
+            break
+
+    return _sin_borde(u, ancho) * escala, historial
+
+
+def restaurar(imagen, metodo="Wiener", psf=None, balance=0.01, iteraciones=20,
+              tolerancia=0.0, escala=255.0):
+    """
+    Deconvolución de una imagen 2D con una PSF dada.
+    Devuelve (imagen_restaurada, informacion) donde `informacion` trae el
+    balance usado (Wiener) o el historial de iteraciones (Richardson-Lucy).
+    """
+    img = a_escala_de_grises(imagen)
+    if psf is None:
+        raise ValueError("Hace falta una PSF.")
+
+    if metodo in ("Wiener", "Wiener no supervisado"):
+        salida, usado = deconvolucion_wiener(
+            img, psf, balance, escala, no_supervisado=(metodo != "Wiener")
+        )
+        return salida, {"balance_usado": usado}
+    if metodo == "Richardson-Lucy":
+        salida, historial = richardson_lucy(img, psf, iteraciones, tolerancia, escala)
+        return salida, {"historial": historial}
+
+    raise ValueError(f"Método de deconvolución desconocido: {metodo}")
+
+
+# 4.b  Artefactos periódicos: detección en Fourier y filtro notch
+
+TIPOS_NOTCH = ["Gaussiano", "Ideal", "Butterworth"]
+
+
+def detectar_picos_fft(imagen, cantidad=6, radio_min_rel=0.015, separacion=5):
+    """
+    Picos del espectro que sobresalen de su anillo (patrones periódicos).
+    Para cada uno devuelve su posición en el espectro centrado, la
+    frecuencia (ciclos/px), el período (px), la orientación y la
+    prominencia sobre la mediana del anillo. Los pares simétricos
+    (f y -f) se informan una sola vez.
+    """
+    img = a_escala_de_grises(imagen)
+    alto, ancho = img.shape
+    ventana = np.outer(np.hanning(alto), np.hanning(ancho))
+    log_mag = np.log1p(
+        np.abs(np.fft.fftshift(np.fft.fft2((img - img.mean()) * ventana)))
+    )
+
+    radio = _distancia_radial(img.shape)
+    anillos = radio.astype(int)
+    mediana_anillo = np.asarray(
+        ndi.median(log_mag, anillos, np.arange(anillos.max() + 1))
+    )
+    prominencia = log_mag - mediana_anillo[anillos]
+
+    maximos = ndi.maximum_filter(prominencia, size=separacion)
+    radio_min = max(4, int(radio_min_rel * min(alto, ancho)))
+    candidatos = (prominencia >= maximos) & (radio > radio_min)
+
+    filas, columnas = np.where(candidatos)
+    orden = np.argsort(prominencia[filas, columnas])[::-1]
+
+    centro_f, centro_c = alto // 2, ancho // 2
+    picos = []
+    vistos = set()
+    for indice in orden:
+        fila, columna = int(filas[indice]), int(columnas[indice])
+        simetrico = (2 * centro_f - fila, 2 * centro_c - columna)
+        if (fila, columna) in vistos or simetrico in vistos:
+            continue
+        vistos.add((fila, columna))
+
+        fy = (fila - centro_f) / alto
+        fx = (columna - centro_c) / ancho
+        frecuencia = np.hypot(fx, fy)
+        picos.append({
+            "fila": fila,
+            "columna": columna,
+            "fy": float(fy),
+            "fx": float(fx),
+            "frecuencia": float(frecuencia),
+            "periodo_px": float(1 / frecuencia) if frecuencia > 0 else np.inf,
+            "angulo_grados": float(np.degrees(np.arctan2(fy, fx))),
+            "prominencia": float(prominencia[fila, columna]),
+        })
+        if len(picos) >= cantidad:
+            break
+
+    return picos, log_mag
+
+
+def mascara_notch(forma, picos, radio=5.0, tipo="Gaussiano", orden=2):
+    """
+    Máscara multiplicativa (espectro centrado) que atenúa cada pico y su
+    simétrico. `radio` es la extensión del notch en píxeles del espectro:
+    tiene que cubrir el ancho del pico, pero no más.
+      Ideal: corta de golpe (puede dejar ondulaciones tipo Gibbs).
+      Gaussiano: transición suave.
+      Butterworth: transición controlada por el orden.
+    """
+    if radio <= 0:
+        raise ValueError("El radio del notch debe ser positivo.")
+
+    alto, ancho = forma
+    centro_f, centro_c = alto // 2, ancho // 2
+    filas, columnas = np.indices(forma)
+    mascara = np.ones(forma, dtype=float)
+
+    for pico in picos:
+        posiciones = [
+            (pico["fila"], pico["columna"]),
+            (2 * centro_f - pico["fila"], 2 * centro_c - pico["columna"]),
+        ]
+        for fila, columna in posiciones:
+            d = np.hypot(filas - fila, columnas - columna)
+            if tipo == "Ideal":
+                mascara[d <= radio] = 0.0
+            elif tipo == "Butterworth":
+                with np.errstate(divide="ignore"):
+                    mascara *= 1.0 / (1.0 + (radio / np.maximum(d, 1e-9)) ** (2 * orden))
+            else:
+                mascara *= 1.0 - np.exp(-(d ** 2) / (2 * radio ** 2))
+
+    return mascara
+
+
+def aplicar_notch(imagen, mascara):
+    """Filtra la imagen con la máscara en el espectro centrado."""
+    img = a_escala_de_grises(imagen)
+    espectro = np.fft.fftshift(np.fft.fft2(img))
+    filtrada = np.real(np.fft.ifft2(np.fft.ifftshift(espectro * mascara)))
+    return filtrada, espectro
+
+
+def verificar_notch(original, filtrada):
+    """
+    Valores para controlar que el notch se haya llevado el patrón y no la
+    anatomía (la lectura es de quien analiza):
+      - fraccion_energia_removida: ||o - f||² / ||o - media||².
+      - correlacion_residuo_filtrada: correlación entre lo removido y lo
+        que quedó (la anatomía estimada). El patrón periódico es ajeno a
+        la anatomía: cerca de 0 significa que lo removido es independiente
+        de lo que se conserva.
+      - correlacion_residuo_original: lo mismo contra la imagen de entrada,
+        que todavía contiene el patrón.
+      - razon_energia_gradiente: energía de gradiente después / antes
+        (cuánto se ablandaron los bordes).
+      - razon_varianza: varianza después / antes.
+    """
+    original = np.asarray(original, dtype=float)
+    filtrada = np.asarray(filtrada, dtype=float)
+    residuo = original - filtrada
+
+    def energia_gradiente(img):
+        gy, gx = np.gradient(img)
+        return float(np.mean(gx ** 2 + gy ** 2))
+
+    energia_total = float(np.sum((original - original.mean()) ** 2))
+
+    def correlacion(otra):
+        if residuo.std() == 0 or otra.std() == 0:
+            return 0.0
+        return float(np.corrcoef(residuo.ravel(), otra.ravel())[0, 1])
+
+    return {
+        "fraccion_energia_removida": float(np.sum(residuo ** 2)) / max(energia_total, 1e-12),
+        "correlacion_residuo_filtrada": correlacion(filtrada),
+        "correlacion_residuo_original": correlacion(original),
+        "razon_energia_gradiente": energia_gradiente(filtrada)
+        / max(energia_gradiente(original), 1e-12),
+        "razon_varianza": float(filtrada.var()) / max(float(original.var()), 1e-12),
+        "residuo_amplitud_pico_a_pico": float(np.ptp(residuo)),
+    }
 
 
 # ------------------------------------------------------------
@@ -1068,27 +1389,548 @@ def restaurar(imagen, metodo="wiener", **kwargs):
 # (dark/flat-field, kernel de gran escala, rolling ball,
 #  white top-hat, homomórfica)
 # ------------------------------------------------------------
-def corregir_fondo(imagen, metodo="rolling_ball", **kwargs):
-    # >>> ACÁ COMPLETAMOS: corrección de iluminación / inhomogeneidad
-    raise NotImplementedError("Actividad 5: corrección de fondo sin implementar.")
+#
+# Cada función devuelve (corregida, fondo_estimado): el fondo se puede
+# mirar como capa para ver qué se está quitando.
+
+METODOS_FONDO = [
+    "Dark-field / flat-field",
+    "Kernel de gran escala",
+    "Rolling ball",
+    "White top-hat",
+    "Homomórfica",
+]
+
+
+def _nivel(img, fondo, conservar_nivel):
+    """Offset que se suma tras restar el fondo (para no dejar todo en ~0)."""
+    return float(np.mean(fondo)) if conservar_nivel else 0.0
+
+
+def fondo_flat_field(img, flat, dark=None):
+    """
+    Corrección por campos de referencia:
+        corregida = (I - D) / (F - D) · media(F - D)
+    D (dark-field) es la señal con el obturador cerrado: corriente de
+    oscuridad y offset del sensor. F (flat-field) es una toma de campo
+    uniforme: recoge la respuesta del sistema (viñeteo, polvo, ganancia
+    de cada píxel). El factor media(F - D) devuelve la imagen a su
+    nivel original en vez de dejarla alrededor de 1.
+    """
+    flat = a_escala_de_grises(flat)
+    oscuro = np.zeros_like(img) if dark is None else a_escala_de_grises(dark)
+    if flat.shape != img.shape or oscuro.shape != img.shape:
+        raise ValueError(
+            "El flat-field y el dark-field deben tener el mismo tamaño que la región."
+        )
+
+    ganancia = flat - oscuro
+    media = float(np.mean(ganancia))
+    if media <= 0:
+        raise ValueError("El flat-field menos el dark-field da un campo vacío.")
+
+    corregida = (img - oscuro) / np.where(np.abs(ganancia) < 1e-9, 1e-9, ganancia) * media
+    return corregida, ganancia
+
+
+def fondo_kernel_grande(img, sigma=50.0, tipo="Gaussiano", modo="Resta",
+                        conservar_nivel=True):
+    """
+    Estima el fondo suavizando la imagen con un kernel mucho más grande
+    que las estructuras de interés (gaussiano o mediana) y lo quita.
+      Resta:    corregida = I - B + media(B)   (fondo aditivo)
+      División: corregida = I / B · media(B)   (fondo multiplicativo)
+    """
+    if sigma <= 0:
+        raise ValueError("El tamaño del kernel debe ser positivo.")
+
+    if tipo == "Mediana":
+        fondo = ndi.median_filter(img, size=int(max(3, 2 * round(sigma) + 1)))
+    else:
+        fondo = ndi.gaussian_filter(img, sigma=sigma)
+
+    if modo == "División":
+        seguro = np.where(np.abs(fondo) < 1e-9, 1e-9, fondo)
+        return img / seguro * float(np.mean(fondo)), fondo
+    return img - fondo + _nivel(img, fondo, conservar_nivel), fondo
+
+
+def fondo_rolling_ball(img, radio=50.0, conservar_nivel=True):
+    """
+    Rolling ball: hace rodar una esfera de radio `radio` por debajo de la
+    superficie de intensidades; lo que toca es el fondo. El radio tiene
+    que ser mayor que las estructuras que se quieren conservar.
+    """
+    if radio <= 0:
+        raise ValueError("El radio de la bola debe ser positivo.")
+    fondo = rolling_ball(img, radius=float(radio))
+    return img - fondo + _nivel(img, fondo, conservar_nivel), fondo
+
+
+def fondo_tophat(img, radio=25.0, conservar_nivel=True):
+    """
+    White top-hat: I - apertura(I). La apertura con un disco de radio
+    `radio` borra todo lo más chico que el disco (queda el fondo), así
+    que la resta deja las estructuras claras y chicas.
+    """
+    if radio <= 0:
+        raise ValueError("El radio del top-hat debe ser positivo.")
+    elemento = disk(int(round(radio)))
+    corregida = white_tophat(img, elemento)
+    fondo = img - corregida
+    return corregida + _nivel(img, fondo, conservar_nivel), fondo
+
+
+def fondo_homomorfico(img, gamma_bajo=0.5, gamma_alto=1.5, corte=0.05):
+    """
+    Corrección homomórfica: si I = iluminación · reflectancia, en log se
+    vuelve una suma. La iluminación es de baja frecuencia y la
+    reflectancia de alta, así que se filtra en log con
+        H = gamma_bajo + (gamma_alto - gamma_bajo)·(1 - exp(-D²/D0²))
+    y se vuelve con exp. gamma_bajo < 1 atenúa la iluminación despareja;
+    gamma_alto > 1 realza el detalle. `corte` es D0 en fracción de
+    Nyquist: más grande = se considera "iluminación" un rango más amplio.
+    """
+    if not 0 < corte <= 1:
+        raise ValueError("El corte debe estar entre 0 y 1 (fracción de Nyquist).")
+
+    desplazado = img - img.min() + 1.0
+    logaritmo = np.log(desplazado)
+
+    alto, ancho = img.shape
+    radio = _distancia_radial(img.shape) / (min(alto, ancho) / 2)
+    filtro = gamma_bajo + (gamma_alto - gamma_bajo) * (
+        1 - np.exp(-(radio ** 2) / (corte ** 2))
+    )
+
+    espectro = np.fft.fftshift(np.fft.fft2(logaritmo))
+    corregida = np.exp(np.real(np.fft.ifft2(np.fft.ifftshift(espectro * filtro))))
+    corregida = corregida + img.min() - 1.0
+
+    # Atenuar las bajas frecuencias comprime el nivel general: se reescala
+    # con una ganancia constante para volver a la media original (la
+    # ganancia es un factor único, no cambia el contraste relativo).
+    media_actual = float(np.mean(corregida))
+    if abs(media_actual) > 1e-9:
+        corregida = corregida * (float(np.mean(img)) / media_actual)
+
+    # Fondo implícito: lo que se le quitó a la imagen
+    return corregida, img - corregida + float(np.mean(img))
+
+
+def corregir_fondo(imagen, metodo="Rolling ball", flat=None, dark=None,
+                   sigma_fondo=50.0, tipo_kernel="Gaussiano",
+                   modo_correccion="Resta", radio_bola=50.0, radio_tophat=25.0,
+                   gamma_bajo=0.5, gamma_alto=1.5, corte=0.05,
+                   conservar_nivel=True, **kwargs):
+    """Aplica el método de corrección de fondo elegido: (corregida, fondo)."""
+    img = a_escala_de_grises(imagen)
+
+    if metodo == "Dark-field / flat-field":
+        if flat is None:
+            raise ValueError("Elegí la capa de flat-field.")
+        return fondo_flat_field(img, flat, dark)
+    if metodo == "Kernel de gran escala":
+        return fondo_kernel_grande(
+            img, sigma_fondo, tipo_kernel, modo_correccion, conservar_nivel
+        )
+    if metodo == "Rolling ball":
+        return fondo_rolling_ball(img, radio_bola, conservar_nivel)
+    if metodo == "White top-hat":
+        return fondo_tophat(img, radio_tophat, conservar_nivel)
+    if metodo == "Homomórfica":
+        return fondo_homomorfico(img, gamma_bajo, gamma_alto, corte)
+
+    raise ValueError(f"Método de corrección de fondo desconocido: {metodo}")
+
+
+def medidas_fondo(img, lista_rois=None):
+    """
+    Valores para comparar antes y después (uniformidad del fondo).
+      fondo_borde_centro: nivel medio de las esquinas / nivel del centro.
+      rango_fondo_suave: cuánto varía la imagen muy suavizada (p95 - p5),
+        es decir la amplitud de la inhomogeneidad que queda.
+      cv_medias_rois: dispersión de las medias entre ROIs (si hay 2 o más);
+        con el fondo corregido, ROIs del mismo tejido deberían acercarse.
+    """
+    img = np.asarray(img, dtype=float)
+    suave = ndi.gaussian_filter(img, sigma=max(3, min(img.shape) / 20))
+
+    medidas = {
+        "media": float(img.mean()),
+        "desvio": float(img.std()),
+        "fondo_borde_centro": indicador_fondo(img)["relacion_borde_centro"],
+        "rango_fondo_suave": float(np.percentile(suave, 95) - np.percentile(suave, 5)),
+        "sigma_wavelet": descomposicion_wavelet(img, "db2", 1)["sigma_donoho"],
+    }
+    if lista_rois and len(lista_rois) >= 2:
+        medias = np.array([float(np.mean(datos)) for _, datos in lista_rois])
+        medidas["cv_medias_rois"] = float(medias.std() / max(abs(medias.mean()), 1e-12))
+    return medidas
 
 
 # ------------------------------------------------------------
 # Actividad 6 - Realce
 # (gamma, log, sigmoidal, CLAHE, pasa-altos, pasa-banda, unsharp)
 # ------------------------------------------------------------
-def realzar(imagen, metodo="clahe", **kwargs):
-    # >>> ACÁ COMPLETAMOS: realce de contraste sin amplificar ruido de más
-    raise NotImplementedError("Actividad 6: realce sin implementar.")
+#
+# Las transformaciones de intensidad (gamma, log, sigmoidal, CLAHE)
+# trabajan sobre la imagen normalizada a [0, 1] y vuelven al rango
+# original, así el antes y el después son comparables.
+
+METODOS_REALCE = [
+    "Gamma",
+    "Logarítmica",
+    "Sigmoidal",
+    "CLAHE",
+    "Pasa-altos",
+    "Pasa-banda",
+    "Unsharp masking",
+]
+
+
+def _normalizar(img):
+    """Lleva la imagen a [0, 1] y devuelve (normalizada, minimo, rango)."""
+    img = np.asarray(img, dtype=float)
+    minimo = float(img.min())
+    rango = float(img.max()) - minimo
+    if rango <= 0:
+        raise ValueError("La región es constante: no hay nada que realzar.")
+    return (img - minimo) / rango, minimo, rango
+
+
+def realce_gamma(img, gamma=0.7):
+    """
+    s = r^gamma sobre [0, 1].
+    gamma < 1 aclara y expande el contraste de las zonas oscuras;
+    gamma > 1 oscurece y expande el de las zonas claras.
+    """
+    if gamma <= 0:
+        raise ValueError("gamma debe ser positivo.")
+    normalizada, minimo, rango = _normalizar(img)
+    return normalizada ** gamma * rango + minimo
+
+
+def realce_logaritmico(img, factor=10.0):
+    """
+    s = log(1 + factor·r) / log(1 + factor).
+    Expande los niveles oscuros y comprime los claros; `factor` regula
+    cuánto (más grande = más expansión de las sombras).
+    """
+    if factor <= 0:
+        raise ValueError("El factor debe ser positivo.")
+    normalizada, minimo, rango = _normalizar(img)
+    salida = np.log1p(factor * normalizada) / np.log1p(factor)
+    return salida * rango + minimo
+
+
+def realce_sigmoidal(img, centro=0.5, ganancia=10.0):
+    """
+    s = 1 / (1 + exp(ganancia·(centro - r))), reescalada a [0, 1].
+    Estira el contraste alrededor de `centro` (en fracción del rango) y
+    comprime los extremos. `ganancia` es la pendiente.
+    """
+    normalizada, minimo, rango = _normalizar(img)
+    salida = 1.0 / (1.0 + np.exp(ganancia * (centro - normalizada)))
+    bajo = 1.0 / (1.0 + np.exp(ganancia * centro))
+    alto = 1.0 / (1.0 + np.exp(ganancia * (centro - 1.0)))
+    salida = (salida - bajo) / max(alto - bajo, 1e-12)
+    return salida * rango + minimo
+
+
+def realce_clahe(img, tamano_mosaico=64, limite_contraste=0.01, niveles=256):
+    """
+    CLAHE: ecualiza el histograma por mosaicos e interpola entre ellos.
+    `limite_contraste` recorta el histograma de cada mosaico antes de
+    ecualizar: es el freno a la amplificación del ruido en zonas planas.
+    """
+    normalizada, minimo, rango = _normalizar(img)
+    salida = equalize_adapthist(
+        normalizada,
+        kernel_size=int(max(3, tamano_mosaico)),
+        clip_limit=float(limite_contraste),
+        nbins=int(niveles),
+    )
+    return salida * rango + minimo
+
+
+def realce_pasa_altos(img, sigma=3.0, conservar_nivel=True):
+    """
+    Pasa-altos espacial: I - gaussiana(I, sigma). Deja los detalles finos
+    y bordes; quita las variaciones lentas (incluido el fondo).
+    """
+    img = np.asarray(img, dtype=float)
+    detalle = img - ndi.gaussian_filter(img, sigma=sigma)
+    return detalle + (float(img.mean()) if conservar_nivel else 0.0)
+
+
+def realce_pasa_banda(img, sigma_bajo=1.0, sigma_alto=8.0, conservar_nivel=True):
+    """
+    Pasa-banda por diferencia de gaussianas: gauss(σ_bajo) - gauss(σ_alto).
+    Conserva las estructuras de tamaño intermedio: σ_bajo frena el ruido
+    de 1 px y σ_alto quita el fondo.
+    """
+    if sigma_bajo >= sigma_alto:
+        raise ValueError("σ bajo debe ser menor que σ alto.")
+    img = np.asarray(img, dtype=float)
+    banda = ndi.gaussian_filter(img, sigma_bajo) - ndi.gaussian_filter(img, sigma_alto)
+    return banda + (float(img.mean()) if conservar_nivel else 0.0)
+
+
+def realce_unsharp(img, sigma=2.0, cantidad=1.0, umbral=0.0):
+    """
+    Unsharp masking: I + cantidad·(I - gaussiana(I, sigma)).
+    Con `umbral` > 0 solo se realzan los detalles cuya amplitud supera
+    ese valor (en intensidad): evita amplificar el ruido de las zonas planas.
+    """
+    img = np.asarray(img, dtype=float)
+    detalle = img - ndi.gaussian_filter(img, sigma=sigma)
+    if umbral > 0:
+        detalle = np.where(np.abs(detalle) > umbral, detalle, 0.0)
+    return img + cantidad * detalle
+
+
+def realzar(imagen, metodo="Gamma", gamma=0.7, factor_log=10.0, centro=0.5,
+            ganancia=10.0, tamano_mosaico=64, limite_contraste=0.01,
+            sigma_altos=3.0, sigma_bajo=1.0, sigma_alto=8.0, sigma_unsharp=2.0,
+            cantidad=1.0, umbral=0.0, conservar_nivel=True, **kwargs):
+    """Aplica el método de realce elegido a una imagen 2D."""
+    img = a_escala_de_grises(imagen)
+
+    if metodo == "Gamma":
+        return realce_gamma(img, gamma)
+    if metodo == "Logarítmica":
+        return realce_logaritmico(img, factor_log)
+    if metodo == "Sigmoidal":
+        return realce_sigmoidal(img, centro, ganancia)
+    if metodo == "CLAHE":
+        return realce_clahe(img, tamano_mosaico, limite_contraste)
+    if metodo == "Pasa-altos":
+        return realce_pasa_altos(img, sigma_altos, conservar_nivel)
+    if metodo == "Pasa-banda":
+        return realce_pasa_banda(img, sigma_bajo, sigma_alto, conservar_nivel)
+    if metodo == "Unsharp masking":
+        return realce_unsharp(img, sigma_unsharp, cantidad, umbral)
+
+    raise ValueError(f"Método de realce desconocido: {metodo}")
+
+
+def entropia(img, niveles=256):
+    """
+    Entropía de Shannon del histograma (bits). Baja cuando la
+    transformación junta niveles distintos en uno solo, es decir cuando
+    se pierde información de intensidad.
+    """
+    img = np.asarray(img, dtype=float)
+    conteos, _ = np.histogram(img, bins=niveles)
+    p = conteos[conteos > 0] / conteos.sum()
+    return float(-np.sum(p * np.log2(p)))
+
+
+def medidas_realce(img, lista_rois=None, limites=None):
+    """
+    Valores para evaluar un realce.
+      contraste_rms / rango_p1_p99: cuánto contraste hay.
+      entropia: información de intensidad que sobrevive.
+      sigma_wavelet: nivel de ruido (si sube, el realce lo amplificó).
+      fraccion_saturados: píxeles pegados a los extremos del rango
+        `limites` (el de la imagen original): ahí la información se pierde
+        porque distintos niveles quedan en el mismo valor.
+      snr_roi_i = media/σ de cada ROI; cnr_i_j = |μi - μj| / √((σi²+σj²)/2).
+    """
+    img = np.asarray(img, dtype=float)
+    medidas = {
+        "media": float(img.mean()),
+        "contraste_rms": float(img.std()),
+        "rango_p1_p99": float(np.percentile(img, 99) - np.percentile(img, 1)),
+        "entropia": entropia(img),
+        "sigma_wavelet": descomposicion_wavelet(img, "db2", 1)["sigma_donoho"],
+    }
+
+    if limites is not None:
+        bajo, alto = limites
+        margen = 0.01 * (alto - bajo)
+        medidas["fraccion_saturados"] = float(
+            np.mean((img <= bajo + margen) | (img >= alto - margen))
+        )
+
+    if lista_rois:
+        estadisticas = []
+        for indice, datos in lista_rois:
+            datos = np.asarray(datos, dtype=float)
+            if datos.size < 2:
+                continue
+            media, desvio = float(datos.mean()), float(datos.std(ddof=1))
+            estadisticas.append((indice, media, desvio))
+            if desvio > 0:
+                medidas[f"snr_roi{indice + 1}"] = media / desvio
+        for (i, media_i, desvio_i), (j, media_j, desvio_j) in combinations(
+            estadisticas, 2
+        ):
+            ruido = np.sqrt((desvio_i ** 2 + desvio_j ** 2) / 2)
+            if ruido > 0:
+                medidas[f"cnr_roi{i + 1}_roi{j + 1}"] = abs(media_i - media_j) / ruido
+
+    return medidas
+
+
+def comparar_realce(original, realzada):
+    """
+    Razones después/antes y correlación con la imagen de entrada.
+    razon_sigma_wavelet > 1 significa que el ruido se amplificó;
+    la correlación baja cuando el realce cambió mucho la estructura.
+    """
+    original = np.asarray(original, dtype=float)
+    realzada = np.asarray(realzada, dtype=float)
+
+    sigma_antes = descomposicion_wavelet(original, "db2", 1)["sigma_donoho"]
+    sigma_despues = descomposicion_wavelet(realzada, "db2", 1)["sigma_donoho"]
+    correlacion = 0.0
+    if original.std() > 0 and realzada.std() > 0:
+        correlacion = float(np.corrcoef(original.ravel(), realzada.ravel())[0, 1])
+
+    return {
+        "razon_sigma_wavelet": sigma_despues / max(sigma_antes, 1e-12),
+        "razon_contraste_rms": float(realzada.std()) / max(float(original.std()), 1e-12),
+        "razon_entropia": entropia(realzada) / max(entropia(original), 1e-12),
+        "correlacion_con_original": correlacion,
+    }
 
 
 # ------------------------------------------------------------
 # Actividad 7 - Evaluación
-# (métricas SIN referencia: SNR, CNR, etc. / CON referencia: PSNR, SSIM)
+# (SIN referencia: SNR, CNR, uniformidad / CON referencia: MSE, PSNR, SSIM)
 # ------------------------------------------------------------
-def evaluar(imagen_antes, imagen_despues, referencia=None, **kwargs):
-    # >>> ACÁ COMPLETAMOS: calcular las métricas que correspondan al objetivo
-    raise NotImplementedError("Actividad 7: métricas sin implementar.")
+#
+# Las métricas sin referencia se calculan sobre las ROIs: SNR y
+# uniformidad necesitan una región de un solo tejido, y CNR necesita
+# dos regiones distintas. Las métricas con referencia comparan píxel a
+# píxel contra una imagen de referencia del mismo tamaño.
+
+
+def uniformidad(datos):
+    """
+    Uniformidad integral: 1 - (p95 - p5) / (p95 + p5).
+    Vale 1 si la región es perfectamente plana y baja cuando hay
+    gradiente de fondo. Se usan percentiles para que un píxel aislado
+    no defina el resultado.
+    """
+    valores = _valores(datos)
+    if valores.size < 2:
+        raise ValueError("La región tiene menos de dos píxeles.")
+    alto = float(np.percentile(valores, 95))
+    bajo = float(np.percentile(valores, 5))
+    if abs(alto + bajo) < 1e-12:
+        return 0.0
+    return 1.0 - (alto - bajo) / (alto + bajo)
+
+
+def metricas_sin_referencia(img, lista_rois=None):
+    """
+    SNR, CNR y uniformidad (más contraste y ruido global).
+      snr_roiN      = media / desvío de esa ROI.
+      uniformidad_roiN = uniformidad integral de esa ROI.
+      cnr_roiI_roiJ = |μI - μJ| / √((σI² + σJ²) / 2).
+      uniformidad_entre_rois = 1 - (max - min) / (max + min) de las medias.
+    """
+    img = np.asarray(img, dtype=float)
+    metricas = {
+        "media": float(img.mean()),
+        "contraste_rms": float(img.std()),
+        "rango_p1_p99": float(np.percentile(img, 99) - np.percentile(img, 1)),
+        "sigma_wavelet": descomposicion_wavelet(img, "db2", 1)["sigma_donoho"],
+        "uniformidad_global": uniformidad(img),
+        "fondo_borde_centro": indicador_fondo(img)["relacion_borde_centro"],
+    }
+
+    estadisticas = []
+    for indice, datos in lista_rois or []:
+        datos = _valores(datos)
+        if datos.size < 2:
+            continue
+        media, desvio = float(datos.mean()), float(datos.std(ddof=1))
+        estadisticas.append((indice, media, desvio))
+        if desvio > 0:
+            metricas[f"snr_roi{indice + 1}"] = media / desvio
+        metricas[f"uniformidad_roi{indice + 1}"] = uniformidad(datos)
+
+    for (i, media_i, desvio_i), (j, media_j, desvio_j) in combinations(estadisticas, 2):
+        ruido = np.sqrt((desvio_i ** 2 + desvio_j ** 2) / 2)
+        if ruido > 0:
+            metricas[f"cnr_roi{i + 1}_roi{j + 1}"] = abs(media_i - media_j) / ruido
+
+    if len(estadisticas) >= 2:
+        medias = np.array([m for _, m, _ in estadisticas])
+        suma = medias.max() + medias.min()
+        if abs(suma) > 1e-12:
+            metricas["uniformidad_entre_rois"] = 1.0 - (
+                medias.max() - medias.min()
+            ) / suma
+
+    return metricas
+
+
+def metricas_con_referencia(img, referencia, rango_datos=None):
+    """
+    MSE, RMSE, MAE, PSNR y SSIM contra una imagen de referencia.
+      MSE/RMSE/MAE: error medio píxel a píxel (0 = idénticas).
+      PSNR = 10·log10(rango² / MSE) en dB: crece al achicarse el error.
+      SSIM: compara luminancia, contraste y estructura en ventanas
+        locales; 1 = idénticas. Devuelve también el mapa por píxel.
+    `rango_datos` es el rango dinámico usado por PSNR y SSIM.
+    """
+    img = np.asarray(img, dtype=float)
+    referencia = np.asarray(referencia, dtype=float)
+    if img.shape != referencia.shape:
+        raise ValueError(
+            f"La imagen {img.shape} y la referencia {referencia.shape} "
+            "tienen tamaños distintos."
+        )
+
+    if rango_datos is None:
+        rango_datos = float(
+            max(img.max(), referencia.max()) - min(img.min(), referencia.min())
+        )
+    rango_datos = max(float(rango_datos), 1e-12)
+
+    error = img - referencia
+    mse = float(np.mean(error ** 2))
+    psnr = 10 * np.log10(rango_datos ** 2 / mse) if mse > 0 else np.inf
+    ssim, mapa = structural_similarity(
+        referencia, img, data_range=rango_datos, full=True
+    )
+
+    correlacion = 0.0
+    if img.std() > 0 and referencia.std() > 0:
+        correlacion = float(np.corrcoef(img.ravel(), referencia.ravel())[0, 1])
+
+    return {
+        "mse": mse,
+        "rmse": float(np.sqrt(mse)),
+        "mae": float(np.mean(np.abs(error))),
+        "psnr_db": float(psnr),
+        "ssim": float(ssim),
+        "correlacion": correlacion,
+        "rango_datos": rango_datos,
+    }, mapa
+
+
+def evaluar(imagen, referencia=None, lista_rois=None, rango_datos=None):
+    """
+    Métricas de la Actividad 7: siempre las que no necesitan referencia
+    y, si se pasa una, también las de comparación.
+    Devuelve (metricas_sin_referencia, metricas_con_referencia, mapa_ssim).
+    """
+    img = a_escala_de_grises(imagen)
+    sin_referencia = metricas_sin_referencia(img, lista_rois)
+
+    if referencia is None:
+        return sin_referencia, {}, None
+
+    con_referencia, mapa = metricas_con_referencia(
+        img, a_escala_de_grises(referencia), rango_datos
+    )
+    return sin_referencia, con_referencia, mapa
 
 
 # ============================================================
@@ -1205,7 +2047,9 @@ def crear_capa_rois():
 
     viewer.layers.selection.active = roi_layer
     for widget in (widget_medicion, widget_gris, widget_diagnostico,
-                   widget_ruido, widget_filtro):
+                   widget_ruido, widget_filtro, widget_deconvolucion,
+                   widget_notch, widget_fondo, widget_realce,
+                   widget_metricas):
         widget.roi.value = roi_layer
     roi_layer.mode = "add_rectangle"
 
@@ -1913,9 +2757,12 @@ def figura_ruido(nombre, res):
 
 
 def clave_csv(texto):
-    """'Diferencias entre adquisiciones' -> 'diferencias_entre_adquisiciones'."""
-    reemplazos = str.maketrans("áéíóúñ ", "aeioun_")
-    return texto.lower().translate(reemplazos)
+    """'Dark-field / flat-field' -> 'dark_field_flat_field' (para claves y capas)."""
+    reemplazos = str.maketrans("áéíóúñ /-", "aeioun___")
+    clave = texto.lower().translate(reemplazos)
+    while "__" in clave:
+        clave = clave.replace("__", "_")
+    return clave.strip("_")
 
 
 @magicgui(
@@ -2483,6 +3330,1318 @@ widget_filtro.metodo.changed.connect(actualizar_parametros_filtro)
 
 
 # ============================================================
+# 6.5 RESTAURACIÓN Y ARTEFACTOS (Actividad 4)
+#     a) Deconvolución (Wiener / Richardson-Lucy) con PSF sintética
+#        o provista en una capa.
+#     b) Filtro notch: detección de picos en Fourier, diseño del notch
+#        y valores para controlar qué se removió.
+# ============================================================
+
+PARAMETROS_PSF = {
+    "Gaussiana": ["sigma_psf"],
+    "Disco (desenfoque)": ["radio_psf"],
+    "Movimiento lineal": ["longitud_psf", "angulo_psf"],
+    "Capa de napari": ["capa_psf"],
+}
+PARAMETROS_DECONVOLUCION = {
+    "Wiener": ["balance"],
+    "Wiener no supervisado": [],
+    "Richardson-Lucy": ["iteraciones", "tolerancia"],
+}
+TODOS_PARAMETROS_DECONV = sorted(
+    {n for v in PARAMETROS_PSF.values() for n in v}
+    | {n for v in PARAMETROS_DECONVOLUCION.values() for n in v}
+)
+
+
+def medidas_restauracion(img):
+    """Valores para comparar antes y después (nitidez, ruido, contraste)."""
+    gy, gx = np.gradient(np.asarray(img, dtype=float))
+    return {
+        "energia_gradiente": float(np.mean(gx ** 2 + gy ** 2)),
+        "sigma_wavelet": descomposicion_wavelet(img, "db2", 1)["sigma_donoho"],
+        "desvio": float(np.std(img)),
+    }
+
+
+def figura_deconvolucion(nombre, original, restaurada, psf, historial):
+    """Original, restaurada, PSF y (RL) curvas de convergencia."""
+    fig = Figure(figsize=(12, 9), layout="constrained")
+    ejes = fig.subplots(2, 2)
+    vmin, vmax = np.percentile(original, [0.5, 99.5])
+
+    ax = ejes[0, 0]
+    ax.imshow(original, cmap="gray", vmin=vmin, vmax=vmax)
+    ax.set_title("Original")
+
+    ax = ejes[0, 1]
+    ax.imshow(restaurada, cmap="gray", vmin=vmin, vmax=vmax)
+    ax.set_title("Restaurada (misma escala de grises)")
+
+    ax = ejes[1, 0]
+    im = ax.imshow(psf, cmap="viridis")
+    fig.colorbar(im, ax=ax, shrink=0.8)
+    ax.set_title(f"PSF {psf.shape[0]}x{psf.shape[1]} (suma = {psf.sum():.3f})")
+
+    for ax in (ejes[0, 0], ejes[0, 1], ejes[1, 0]):
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    ax = ejes[1, 1]
+    if historial:
+        iteraciones = [h["iteracion"] for h in historial]
+        ax.plot(iteraciones, [h["residuo_rms"] for h in historial],
+                color="tab:blue", label="residuo RMS")
+        ax.set_xlabel("iteración")
+        ax.set_ylabel("residuo RMS", color="tab:blue")
+        eje2 = ax.twinx()
+        eje2.semilogy(iteraciones, [h["cambio"] for h in historial],
+                      color="tab:red", label="cambio relativo")
+        eje2.set_ylabel("cambio relativo", color="tab:red")
+        ax.set_title("Convergencia de Richardson-Lucy")
+    else:
+        fila = original.shape[0] // 2
+        ax.plot(original[fila], color="0.6", linewidth=0.8, label="original")
+        ax.plot(restaurada[fila], color="tab:red", linewidth=1.0, label="restaurada")
+        ax.set_xlabel("columna (px)")
+        ax.set_title(f"Perfil horizontal (fila central {fila})")
+        ax.legend(fontsize=7)
+
+    fig.suptitle(nombre)
+    return fig
+
+
+boton_nsr = PushButton(text="Copiar NSR (σ²/Var) al balance")
+
+
+@boton_nsr.clicked.connect
+def copiar_nsr():
+    try:
+        if not ultimo_sigma_ruido:
+            raise ValueError("Todavía no se estimó el ruido (Act. 2).")
+        imagen = widget_deconvolucion.imagen.value
+        if imagen is None:
+            raise ValueError("Elegí la capa en el bloque de deconvolución.")
+        gris = a_escala_de_grises(imagen.data)
+        nsr = ultimo_sigma_ruido["valor"] ** 2 / max(float(gris.var()), 1e-12)
+        widget_deconvolucion.balance.value = nsr
+        informe.value = (
+            "INFORME\nBalance = σ²/Var(imagen) = "
+            f"{ultimo_sigma_ruido['valor']:.3f}² / {gris.var():.1f} = {nsr:.6f}\n"
+            f"(σ de {ultimo_sigma_ruido['metodo']} sobre {ultimo_sigma_ruido['imagen']})"
+        )
+    except Exception as error:
+        informe.value = f"INFORME\nNo se pudo calcular el NSR:\n{error}"
+
+
+@magicgui(
+    call_button="Aplicar deconvolución",
+    metodo={"choices": METODOS_DECONVOLUCION, "label": "Método"},
+    modo={
+        "choices": ["Imagen completa", "ROI seleccionada"],
+        "label": "Región a restaurar",
+    },
+    excluir_marco={"label": "Quitar marco uniforme"},
+    tipo_psf={"choices": TIPOS_PSF, "label": "PSF"},
+    capa_psf={"label": "Capa con la PSF"},
+    sigma_psf={"label": "σ de la PSF (px)", "min": 0.1, "max": 50.0, "step": 0.1},
+    radio_psf={"label": "Radio del disco (px)", "min": 0.5, "max": 50.0, "step": 0.5},
+    longitud_psf={"label": "Longitud (px)", "min": 2.0, "max": 100.0, "step": 1.0},
+    angulo_psf={"label": "Ángulo (grados)", "min": -180.0, "max": 180.0, "step": 5.0},
+    balance={
+        "label": "Balance (regularización)",
+        "min": 1e-6, "max": 10.0, "step": 0.001,
+    },
+    iteraciones={"label": "Iteraciones máx.", "min": 1, "max": 500},
+    tolerancia={
+        "label": "Parar si cambio <", "min": 0.0, "max": 1.0, "step": 0.0005,
+    },
+    ver_figura={"label": "Mostrar figura comparativa"},
+    registrar={"label": "Agregar al CSV"},
+)
+def widget_deconvolucion(
+    imagen: Image,
+    metodo: str = "Wiener",
+    modo: str = "Imagen completa",
+    roi: Shapes = None,
+    excluir_marco: bool = True,
+    tipo_psf: str = "Gaussiana",
+    capa_psf: Image = None,
+    sigma_psf: float = 2.0,
+    radio_psf: float = 3.0,
+    longitud_psf: float = 9.0,
+    angulo_psf: float = 0.0,
+    balance: float = 0.01,
+    iteraciones: int = 20,
+    tolerancia: float = 0.0,
+    ver_figura: bool = True,
+    registrar: bool = True,
+):
+    if imagen is None:
+        informe.value = "INFORME\nSeleccioná una capa Image."
+        return
+
+    try:
+        region, origen_region, descripcion = region_en_gris(
+            imagen, modo, roi, excluir_marco
+        )
+        escala = escala_intensidad(imagen.data)
+
+        psf = construir_psf(
+            tipo_psf, sigma_psf, radio_psf, longitud_psf, angulo_psf,
+            capa_psf.data if capa_psf is not None else None,
+        )
+
+        inicio = datetime.now()
+        restaurada, info = restaurar(
+            region, metodo=metodo, psf=psf, balance=balance,
+            iteraciones=iteraciones, tolerancia=tolerancia, escala=escala,
+        )
+        segundos = (datetime.now() - inicio).total_seconds()
+
+        nombre_capa = f"{imagen.name}_{clave_csv(metodo)}"
+        capa = agregar_o_actualizar_capa(
+            nombre_capa, restaurada, colormap="gray",
+            translate=tuple(origen_region),
+            contrast_limits=tuple(imagen.contrast_limits),
+        )
+        viewer.layers.selection.active = capa
+
+        antes = medidas_restauracion(region)
+        despues = medidas_restauracion(restaurada)
+
+        parametros = {"psf": tipo_psf}
+        parametros.update({
+            k: v for k, v in dict(
+                sigma_psf=sigma_psf, radio_psf=radio_psf,
+                longitud_psf=longitud_psf, angulo_psf=angulo_psf,
+            ).items() if k in PARAMETROS_PSF[tipo_psf]
+        })
+        if tipo_psf == "Capa de napari":
+            parametros["capa_psf"] = capa_psf.name
+        parametros["psf_tamano"] = f"{psf.shape[0]}x{psf.shape[1]}"
+        for clave in PARAMETROS_DECONVOLUCION[metodo]:
+            parametros[clave] = {"balance": balance, "iteraciones": iteraciones,
+                                 "tolerancia": tolerancia}[clave]
+
+        historial = info.get("historial") or []
+        resultados = {"tiempo_s": segundos, "capa_resultado": nombre_capa}
+        detalle = []
+        if historial:
+            ultimo = historial[-1]
+            resultados.update(
+                iteraciones_realizadas=ultimo["iteracion"],
+                residuo_rms_final=ultimo["residuo_rms"],
+                cambio_final=ultimo["cambio"],
+            )
+            detalle.append(
+                f"Iteraciones realizadas: {ultimo['iteracion']} de {iteraciones}"
+                + ("  (cortó por tolerancia)" if tolerancia > 0
+                   and ultimo["cambio"] < tolerancia else "")
+            )
+            detalle.append(
+                f"Residuo RMS: {historial[0]['residuo_rms']:.4f} → "
+                f"{ultimo['residuo_rms']:.4f}   "
+                f"cambio relativo final: {ultimo['cambio']:.5f}"
+            )
+        elif info.get("balance_usado") is not None:
+            resultados["balance_usado"] = info["balance_usado"]
+        else:
+            resultados["balance_usado"] = "estimado (no supervisado)"
+
+        if ver_figura:
+            nombre_fig = f"Deconvolución: {imagen.name} - {metodo}"
+            fig = figura_deconvolucion(
+                f"{nombre_fig} ({formatear_resultados(parametros)})",
+                region, restaurada, psf, historial,
+            )
+            mostrar_figura(fig, nombre_fig)
+
+        region_fila, etiqueta = region_y_etiqueta(modo, roi)
+        if registrar:
+            agregar_pendientes([crear_registro(
+                imagen=imagen.name,
+                actividad="4 - Restauración (deconvolución)",
+                region=region_fila,
+                etiqueta_roi=etiqueta,
+                metodo=metodo,
+                parametros=parametros,
+                metrica_antes=antes,
+                metrica_despues=despues,
+                resultados=resultados,
+            )])
+
+        informe.value = (
+            "INFORME - DECONVOLUCIÓN (Act. 4)\n"
+            f"Capa: {imagen.name}   Región: {descripcion} "
+            f"({region.shape[0]}x{region.shape[1]})\n"
+            f"Método: {metodo}\n"
+            "Parámetros: " + formatear_resultados(parametros) + "\n"
+            f"Tiempo: {segundos:.2f} s   Capa creada: {nombre_capa}\n"
+            + ("".join(f"{d}\n" for d in detalle))
+            + "\nANTES → DESPUÉS\n"
+            + "\n".join(
+                f"  {clave}: {formatear_valor(antes[clave])} → "
+                f"{formatear_valor(despues[clave])}"
+                for clave in antes
+            )
+            + ("\n\nFila agregada al CSV pendiente." if registrar else "")
+        )
+    except Exception as error:
+        informe.value = f"INFORME\nNo se pudo deconvolucionar:\n{error}"
+
+
+def actualizar_parametros_deconv(event=None):
+    """Muestra solo los parámetros de la PSF y del método elegidos."""
+    visibles = set(PARAMETROS_PSF[widget_deconvolucion.tipo_psf.value])
+    visibles |= set(PARAMETROS_DECONVOLUCION[widget_deconvolucion.metodo.value])
+    for nombre in TODOS_PARAMETROS_DECONV:
+        getattr(widget_deconvolucion, nombre).visible = nombre in visibles
+
+
+widget_deconvolucion.metodo.changed.connect(actualizar_parametros_deconv)
+widget_deconvolucion.tipo_psf.changed.connect(actualizar_parametros_deconv)
+
+
+# ------------------------------------------------------------
+# 6.5.b  Artefactos periódicos: picos de Fourier y filtro notch
+# ------------------------------------------------------------
+
+# Picos detectados en la última corrida (se eligen por número)
+picos_detectados = {"picos": [], "forma": None, "imagen": "", "region": ""}
+
+
+def texto_picos(picos):
+    return "\n".join(
+        f"  {i + 1}. período = {p['periodo_px']:.2f} px   "
+        f"frecuencia = {p['frecuencia']:.4f} ciclos/px   "
+        f"ángulo = {p['angulo_grados']:+.1f}°   "
+        f"prominencia = {p['prominencia']:.2f}   "
+        f"(fila {p['fila']}, columna {p['columna']})"
+        for i, p in enumerate(picos)
+    )
+
+
+def figura_notch(nombre, original, filtrada, log_mag, mascara, picos, radio):
+    """Espectro con los notches marcados, filtrada, residuo y máscara."""
+    fig = Figure(figsize=(12, 9), layout="constrained")
+    ejes = fig.subplots(2, 2)
+    alto, ancho = original.shape
+
+    ax = ejes[0, 0]
+    ax.imshow(log_mag, cmap="gray")
+    centro_f, centro_c = alto // 2, ancho // 2
+    for i, p in enumerate(picos):
+        for fila, columna in (
+            (p["fila"], p["columna"]),
+            (2 * centro_f - p["fila"], 2 * centro_c - p["columna"]),
+        ):
+            ax.add_patch(
+                Circle((columna, fila), radio, fill=False, color="red", linewidth=1)
+            )
+        ax.annotate(str(i + 1), (p["columna"], p["fila"]), color="red", fontsize=8)
+    ax.set_title("log |FFT| con los notches aplicados")
+
+    ax = ejes[0, 1]
+    ax.imshow(mascara, cmap="gray", vmin=0, vmax=1)
+    ax.set_title("Máscara del filtro (0 = atenuado)")
+
+    ax = ejes[1, 0]
+    vmin, vmax = np.percentile(original, [0.5, 99.5])
+    ax.imshow(filtrada, cmap="gray", vmin=vmin, vmax=vmax)
+    ax.set_title("Imagen filtrada")
+
+    ax = ejes[1, 1]
+    residuo = original - filtrada
+    lim = max(np.percentile(np.abs(residuo), 99.5), 1e-9)
+    im = ax.imshow(residuo, cmap="gray", vmin=-lim, vmax=lim)
+    fig.colorbar(im, ax=ax, shrink=0.8)
+    ax.set_title("Residuo = original - filtrada (lo que se quitó)")
+
+    for ax in ejes.ravel():
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    fig.suptitle(nombre)
+    return fig
+
+
+boton_detectar_picos = PushButton(text="Detectar picos en Fourier")
+
+
+@boton_detectar_picos.clicked.connect
+def detectar_picos():
+    try:
+        imagen = widget_notch.imagen.value
+        if imagen is None:
+            raise ValueError("Elegí la capa en el bloque de artefactos.")
+        region, _, descripcion = region_en_gris(
+            imagen, widget_notch.modo.value, widget_notch.roi.value,
+            widget_notch.excluir_marco.value,
+        )
+        picos, log_mag = detectar_picos_fft(
+            region, cantidad=widget_notch.cantidad_picos.value
+        )
+        picos_detectados.update(
+            picos=picos, forma=region.shape, imagen=imagen.name, region=descripcion
+        )
+
+        informe.value = (
+            "INFORME - PICOS DE FOURIER (Act. 4)\n"
+            f"Capa: {imagen.name}   Región: {descripcion} "
+            f"({region.shape[0]}x{region.shape[1]})\n"
+            f"{len(picos)} pico(s) más prominentes (cada uno con su simétrico):\n"
+            + texto_picos(picos)
+            + "\n\nPara filtrar, escribí sus números en 'Picos a filtrar'."
+        )
+    except Exception as error:
+        informe.value = f"INFORME\nNo se pudieron detectar picos:\n{error}"
+
+
+@magicgui(
+    call_button="Aplicar filtro notch",
+    modo={
+        "choices": ["Imagen completa", "ROI seleccionada"],
+        "label": "Región a filtrar",
+    },
+    excluir_marco={"label": "Quitar marco uniforme"},
+    cantidad_picos={"label": "Picos a detectar", "min": 1, "max": 20},
+    picos_elegidos={"label": "Picos a filtrar (ej: 1,2)"},
+    radio_notch={"label": "Radio del notch (px)", "min": 0.5, "max": 100.0, "step": 0.5},
+    tipo_notch={"choices": TIPOS_NOTCH, "label": "Tipo de notch"},
+    orden_butterworth={"label": "Orden (Butterworth)", "min": 1, "max": 10},
+    ver_figura={"label": "Mostrar figura comparativa"},
+    registrar={"label": "Agregar al CSV"},
+)
+def widget_notch(
+    imagen: Image,
+    modo: str = "Imagen completa",
+    roi: Shapes = None,
+    excluir_marco: bool = True,
+    cantidad_picos: int = 6,
+    picos_elegidos: str = "1",
+    radio_notch: float = 5.0,
+    tipo_notch: str = "Gaussiano",
+    orden_butterworth: int = 2,
+    ver_figura: bool = True,
+    registrar: bool = True,
+):
+    if imagen is None:
+        informe.value = "INFORME\nSeleccioná una capa Image."
+        return
+
+    try:
+        region, origen_region, descripcion = region_en_gris(
+            imagen, modo, roi, excluir_marco
+        )
+
+        if not picos_detectados["picos"]:
+            raise ValueError("Primero tocá 'Detectar picos en Fourier'.")
+        if picos_detectados["forma"] != region.shape:
+            raise ValueError(
+                "Los picos se detectaron sobre una región de otro tamaño "
+                f"({picos_detectados['forma']}): detectalos de nuevo."
+            )
+
+        try:
+            numeros = [int(n) for n in picos_elegidos.replace(" ", "").split(",") if n]
+        except ValueError:
+            raise ValueError("Escribí los picos como números separados por comas.")
+        disponibles = picos_detectados["picos"]
+        if not numeros or any(n < 1 or n > len(disponibles) for n in numeros):
+            raise ValueError(f"Elegí números entre 1 y {len(disponibles)}.")
+        picos = [disponibles[n - 1] for n in numeros]
+
+        mascara = mascara_notch(
+            region.shape, picos, radio_notch, tipo_notch, orden_butterworth
+        )
+        filtrada, espectro = aplicar_notch(region, mascara)
+        log_mag = np.log1p(np.abs(espectro))
+
+        nombre_capa = f"{imagen.name}_notch"
+        capa = agregar_o_actualizar_capa(
+            nombre_capa, filtrada, colormap="gray",
+            translate=tuple(origen_region),
+            contrast_limits=tuple(imagen.contrast_limits),
+        )
+        viewer.layers.selection.active = capa
+
+        control = verificar_notch(region, filtrada)
+        antes = medidas_restauracion(region)
+        despues = medidas_restauracion(filtrada)
+        picos_despues, _ = detectar_picos_fft(filtrada, cantidad=1)
+        if picos_despues:
+            despues["pico_fft_prominencia"] = picos_despues[0]["prominencia"]
+        antes["pico_fft_prominencia"] = max(p["prominencia"] for p in picos)
+
+        parametros = {
+            "picos": ",".join(str(n) for n in numeros),
+            "radio": radio_notch,
+            "tipo": tipo_notch,
+        }
+        if tipo_notch == "Butterworth":
+            parametros["orden"] = orden_butterworth
+        for i, p in zip(numeros, picos):
+            parametros[f"pico{i}_periodo_px"] = p["periodo_px"]
+            parametros[f"pico{i}_angulo"] = p["angulo_grados"]
+
+        if ver_figura:
+            nombre_fig = f"Notch: {imagen.name}"
+            fig = figura_notch(
+                f"{nombre_fig} ({formatear_resultados(parametros)})",
+                region, filtrada, log_mag, mascara, picos, radio_notch,
+            )
+            mostrar_figura(fig, nombre_fig)
+
+        region_fila, etiqueta = region_y_etiqueta(modo, roi)
+        resultados = dict(control)
+        resultados["capa_resultado"] = nombre_capa
+        if registrar:
+            agregar_pendientes([crear_registro(
+                imagen=imagen.name,
+                actividad="4 - Artefacto periódico (notch)",
+                region=region_fila,
+                etiqueta_roi=etiqueta,
+                metodo=f"Notch {tipo_notch}",
+                parametros=parametros,
+                metrica_antes=antes,
+                metrica_despues=despues,
+                resultados=resultados,
+            )])
+
+        informe.value = (
+            "INFORME - FILTRO NOTCH (Act. 4)\n"
+            f"Capa: {imagen.name}   Región: {descripcion} "
+            f"({region.shape[0]}x{region.shape[1]})\n"
+            f"Notch {tipo_notch}, radio {radio_notch:g} px, picos {parametros['picos']}\n"
+            + texto_picos(picos)
+            + f"\n\nCapa creada: {nombre_capa}\n"
+            "\nANTES → DESPUÉS\n"
+            + "\n".join(
+                f"  {clave}: {formatear_valor(antes[clave])} → "
+                f"{formatear_valor(despues.get(clave, float('nan')))}"
+                for clave in antes
+            )
+            + "\n\nCONTROL DE LO REMOVIDO\n"
+            + "\n".join(
+                f"  {clave} = {formatear_valor(valor)}"
+                for clave, valor in control.items()
+            )
+            + ("\n\nFila agregada al CSV pendiente." if registrar else "")
+        )
+    except Exception as error:
+        informe.value = f"INFORME\nNo se pudo aplicar el notch:\n{error}"
+
+
+# ============================================================
+# 6.6 CORRECCIÓN DE FONDO (Actividad 5)
+#     Cinco métodos con sus parámetros, más un barrido que genera de
+#     una vez subcorrección / corrección adecuada / sobrecorrección.
+# ============================================================
+
+PARAMETROS_FONDO = {
+    "Dark-field / flat-field": ["capa_flat", "capa_dark"],
+    "Kernel de gran escala": [
+        "sigma_fondo", "tipo_kernel", "modo_correccion", "conservar_nivel",
+    ],
+    "Rolling ball": ["radio_bola", "conservar_nivel"],
+    "White top-hat": ["radio_tophat", "conservar_nivel"],
+    "Homomórfica": ["gamma_bajo", "gamma_alto", "corte"],
+}
+TODOS_PARAMETROS_FONDO = sorted(
+    {n for v in PARAMETROS_FONDO.values() for n in v}
+)
+
+# Parámetro que se barre en la comparación y en qué sentido actúa:
+#   "suaviza"  -> más grande = corrección más suave (subcorrige)
+#   "fortalece" -> más grande = corrección más fuerte (sobrecorrige)
+PARAMETRO_BARRIDO = {
+    "Kernel de gran escala": ("sigma_fondo", "suaviza"),
+    "Rolling ball": ("radio_bola", "suaviza"),
+    "White top-hat": ("radio_tophat", "suaviza"),
+    "Homomórfica": ("corte", "fortalece"),
+}
+
+
+def figura_fondo(nombre, original, corregida, fondo):
+    """Original, fondo estimado, corregida y perfil de la fila central."""
+    fig = Figure(figsize=(12, 9), layout="constrained")
+    ejes = fig.subplots(2, 2)
+    vmin, vmax = np.percentile(original, [0.5, 99.5])
+
+    ax = ejes[0, 0]
+    ax.imshow(original, cmap="gray", vmin=vmin, vmax=vmax)
+    ax.set_title("Original")
+
+    ax = ejes[0, 1]
+    im = ax.imshow(fondo, cmap="viridis")
+    fig.colorbar(im, ax=ax, shrink=0.8)
+    ax.set_title("Fondo estimado")
+
+    ax = ejes[1, 0]
+    ax.imshow(corregida, cmap="gray")
+    ax.set_title("Corregida (contraste propio)")
+
+    for ax in (ejes[0, 0], ejes[0, 1], ejes[1, 0]):
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    ax = ejes[1, 1]
+    fila = original.shape[0] // 2
+    ax.plot(original[fila], color="0.6", linewidth=0.8, label="original")
+    ax.plot(fondo[fila], color="tab:green", linewidth=1.0, label="fondo")
+    ax.plot(corregida[fila], color="tab:red", linewidth=1.0, label="corregida")
+    ax.set_xlabel("columna (px)")
+    ax.set_title(f"Perfil horizontal (fila central {fila})")
+    ax.legend(fontsize=7)
+
+    fig.suptitle(nombre)
+    return fig
+
+
+def figura_barrido(nombre, original, corregidas, parametro):
+    """
+    Compara subcorrección / adecuada / sobrecorrección.
+    `corregidas` es [(etiqueta, valor, imagen), ...].
+    """
+    fig = Figure(figsize=(15, 9), layout="constrained")
+    ejes = fig.subplots(2, 3)
+    vmin, vmax = np.percentile(original, [0.5, 99.5])
+
+    ax = ejes[0, 0]
+    ax.imshow(original, cmap="gray", vmin=vmin, vmax=vmax)
+    ax.set_title("Original")
+
+    for ax, (etiqueta, valor, imagen) in zip(
+        [ejes[0, 1], ejes[0, 2], ejes[1, 0]], corregidas
+    ):
+        ax.imshow(imagen, cmap="gray")
+        ax.set_title(f"{etiqueta} ({parametro} = {valor:g})")
+
+    for ax in (ejes[0, 0], ejes[0, 1], ejes[0, 2], ejes[1, 0]):
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    fila = original.shape[0] // 2
+    ax = ejes[1, 1]
+    for etiqueta, valor, imagen in corregidas:
+        suave = ndi.gaussian_filter(imagen, sigma=max(3, min(imagen.shape) / 20))
+        ax.plot(suave[fila], linewidth=1.0, label=f"{etiqueta} ({valor:g})")
+    suave_original = ndi.gaussian_filter(
+        original, sigma=max(3, min(original.shape) / 20)
+    )
+    ax.plot(suave_original[fila], color="0.6", linewidth=0.8, label="original")
+    ax.set_xlabel("columna (px)")
+    ax.set_title("Fondo residual (imagen muy suavizada, fila central)")
+    ax.legend(fontsize=7)
+
+    ax = ejes[1, 2]
+    bins = 80
+    ax.hist(original.ravel(), bins=bins, density=True, color="0.6",
+            histtype="step", label="original")
+    for etiqueta, valor, imagen in corregidas:
+        ax.hist(imagen.ravel(), bins=bins, density=True, histtype="step",
+                linewidth=1.0, label=etiqueta)
+    ax.set_yscale("log")
+    ax.set_title("Histogramas")
+    ax.legend(fontsize=7)
+
+    fig.suptitle(nombre)
+    return fig
+
+
+def rois_en_arreglo(arreglo, origen_arreglo, roi_layer):
+    """
+    (indice, píxeles) de las ROIs que caen enteras dentro de `arreglo`,
+    cuyo píxel [0, 0] está en `origen_arreglo` (coordenadas del mundo).
+    Permite medir las mismas ROIs antes y después de procesar.
+    """
+    if roi_layer is None or len(roi_layer.data) == 0:
+        return []
+
+    desplazamiento = np.asarray(origen_arreglo, dtype=float)
+    alto, ancho = arreglo.shape
+    salida = []
+    for indice in range(len(roi_layer.data)):
+        vertices = np.asarray(roi_layer.data[indice], dtype=float) - desplazamiento
+        if (
+            vertices.min() < 0
+            or vertices[:, 0].max() > alto
+            or vertices[:, 1].max() > ancho
+        ):
+            continue
+        filas, columnas = polygon(vertices[:, 0], vertices[:, 1], shape=arreglo.shape)
+        if filas.size > 1:
+            salida.append((indice, arreglo[filas, columnas]))
+    return salida
+
+
+def _datos_fondo(imagen, modo, roi, excluir_marco):
+    """Región a corregir, ROIs que caen adentro y descripción."""
+    region, origen_region, descripcion = region_en_gris(
+        imagen, modo, roi, excluir_marco
+    )
+    return region, origen_region, descripcion, rois_en_arreglo(
+        region, origen_region, roi
+    )
+
+
+@magicgui(
+    call_button="Corregir fondo",
+    metodo={"choices": METODOS_FONDO, "label": "Método"},
+    modo={
+        "choices": ["Imagen completa", "ROI seleccionada"],
+        "label": "Región a corregir",
+    },
+    excluir_marco={"label": "Quitar marco uniforme"},
+    capa_flat={"label": "Capa flat-field"},
+    capa_dark={"label": "Capa dark-field (opcional)"},
+    sigma_fondo={"label": "Tamaño del kernel (px)", "min": 1.0, "max": 500.0, "step": 5.0},
+    tipo_kernel={"choices": ["Gaussiano", "Mediana"], "label": "Kernel"},
+    modo_correccion={"choices": ["Resta", "División"], "label": "Fondo aditivo/multiplicativo"},
+    radio_bola={"label": "Radio de la bola (px)", "min": 1.0, "max": 500.0, "step": 5.0},
+    radio_tophat={"label": "Radio del top-hat (px)", "min": 1.0, "max": 300.0, "step": 5.0},
+    gamma_bajo={"label": "γ bajas frecuencias", "min": 0.0, "max": 2.0, "step": 0.05},
+    gamma_alto={"label": "γ altas frecuencias", "min": 0.1, "max": 5.0, "step": 0.05},
+    corte={"label": "Corte D0 (frac. Nyquist)", "min": 0.005, "max": 1.0, "step": 0.005},
+    conservar_nivel={"label": "Conservar nivel medio"},
+    factor_barrido={"label": "Factor del barrido", "min": 1.1, "max": 10.0, "step": 0.1},
+    ver_figura={"label": "Mostrar figura"},
+    registrar={"label": "Agregar al CSV"},
+)
+def widget_fondo(
+    imagen: Image,
+    metodo: str = "Rolling ball",
+    modo: str = "Imagen completa",
+    roi: Shapes = None,
+    excluir_marco: bool = True,
+    capa_flat: Image = None,
+    capa_dark: Image = None,
+    sigma_fondo: float = 50.0,
+    tipo_kernel: str = "Gaussiano",
+    modo_correccion: str = "Resta",
+    radio_bola: float = 50.0,
+    radio_tophat: float = 25.0,
+    gamma_bajo: float = 0.5,
+    gamma_alto: float = 1.5,
+    corte: float = 0.05,
+    conservar_nivel: bool = True,
+    factor_barrido: float = 2.0,
+    ver_figura: bool = True,
+    registrar: bool = True,
+):
+    if imagen is None:
+        informe.value = "INFORME\nSeleccioná una capa Image."
+        return
+
+    try:
+        region, origen_region, descripcion, lista_rois = _datos_fondo(
+            imagen, modo, roi, excluir_marco
+        )
+
+        inicio = datetime.now()
+        corregida, fondo = corregir_fondo(
+            region, metodo=metodo,
+            flat=capa_flat.data if capa_flat is not None else None,
+            dark=capa_dark.data if capa_dark is not None else None,
+            sigma_fondo=sigma_fondo, tipo_kernel=tipo_kernel,
+            modo_correccion=modo_correccion, radio_bola=radio_bola,
+            radio_tophat=radio_tophat, gamma_bajo=gamma_bajo,
+            gamma_alto=gamma_alto, corte=corte, conservar_nivel=conservar_nivel,
+        )
+        segundos = (datetime.now() - inicio).total_seconds()
+
+        nombre_capa = f"{imagen.name}_{clave_csv(metodo)}"
+        capa = agregar_o_actualizar_capa(
+            nombre_capa, corregida, colormap="gray",
+            translate=tuple(origen_region),
+        )
+        agregar_o_actualizar_capa(
+            f"{nombre_capa}_fondo", fondo, colormap="viridis",
+            translate=tuple(origen_region), visible=False,
+        )
+        viewer.layers.selection.active = capa
+
+        antes = medidas_fondo(region, lista_rois)
+        despues = medidas_fondo(
+            corregida, rois_en_arreglo(corregida, origen_region, roi)
+        )
+
+        parametros = {
+            clave: valor for clave, valor in dict(
+                capa_flat=capa_flat.name if capa_flat is not None else "",
+                capa_dark=capa_dark.name if capa_dark is not None else "",
+                sigma_fondo=sigma_fondo, tipo_kernel=tipo_kernel,
+                modo_correccion=modo_correccion, radio_bola=radio_bola,
+                radio_tophat=radio_tophat, gamma_bajo=gamma_bajo,
+                gamma_alto=gamma_alto, corte=corte,
+                conservar_nivel=conservar_nivel,
+            ).items() if clave in PARAMETROS_FONDO[metodo]
+        }
+
+        if ver_figura:
+            nombre_fig = f"Fondo: {imagen.name} - {metodo}"
+            fig = figura_fondo(
+                f"{nombre_fig} ({formatear_resultados(parametros)})",
+                region, corregida, fondo,
+            )
+            mostrar_figura(fig, nombre_fig)
+
+        region_fila, etiqueta = region_y_etiqueta(modo, roi)
+        if registrar:
+            agregar_pendientes([crear_registro(
+                imagen=imagen.name,
+                actividad="5 - Corrección de fondo",
+                region=region_fila,
+                etiqueta_roi=etiqueta,
+                metodo=metodo,
+                parametros=parametros,
+                metrica_antes=antes,
+                metrica_despues=despues,
+                resultados={"tiempo_s": segundos, "capa_resultado": nombre_capa},
+            )])
+
+        informe.value = (
+            "INFORME - CORRECCIÓN DE FONDO (Act. 5)\n"
+            f"Capa: {imagen.name}   Región: {descripcion} "
+            f"({region.shape[0]}x{region.shape[1]})\n"
+            f"Método: {metodo}\n"
+            "Parámetros: " + formatear_resultados(parametros) + "\n"
+            f"Tiempo: {segundos:.2f} s   Capas creadas: {nombre_capa} "
+            f"(+ _fondo)\n\n"
+            "ANTES → DESPUÉS\n"
+            + "\n".join(
+                f"  {clave}: {formatear_valor(antes[clave])} → "
+                f"{formatear_valor(despues.get(clave, float('nan')))}"
+                for clave in antes
+            )
+            + ("\n\nFila agregada al CSV pendiente." if registrar else "")
+        )
+    except Exception as error:
+        informe.value = f"INFORME\nNo se pudo corregir el fondo:\n{error}"
+
+
+boton_barrido_fondo = PushButton(
+    text="Crear sub / adecuada / sobrecorrección"
+)
+
+
+@boton_barrido_fondo.clicked.connect
+def barrido_fondo():
+    """
+    Corre el método tres veces: con el parámetro del panel y con ese
+    parámetro dividido y multiplicado por el factor. Crea las tres capas,
+    una figura comparativa y tres filas del CSV.
+    """
+    try:
+        valores = widget_fondo.asdict()
+        metodo = valores["metodo"]
+        imagen = valores["imagen"]
+        if imagen is None:
+            raise ValueError("Elegí la capa en el bloque de corrección de fondo.")
+        if metodo not in PARAMETRO_BARRIDO:
+            raise ValueError(
+                "El barrido no aplica a dark/flat-field: la corrección queda "
+                "definida por los campos de referencia, no por un parámetro."
+            )
+
+        parametro, sentido = PARAMETRO_BARRIDO[metodo]
+        base = valores[parametro]
+        factor = valores["factor_barrido"]
+        menor, mayor = base / factor, base * factor
+        if sentido == "suaviza":
+            barrido = [
+                ("Sobrecorrección", menor),
+                ("Corrección adecuada", base),
+                ("Subcorrección", mayor),
+            ]
+        else:
+            barrido = [
+                ("Subcorrección", menor),
+                ("Corrección adecuada", base),
+                ("Sobrecorrección", mayor),
+            ]
+
+        region, origen_region, descripcion, lista_rois = _datos_fondo(
+            imagen, valores["modo"], valores["roi"], valores["excluir_marco"]
+        )
+        antes = medidas_fondo(region, lista_rois)
+
+        comunes = dict(
+            flat=valores["capa_flat"].data if valores["capa_flat"] is not None else None,
+            dark=valores["capa_dark"].data if valores["capa_dark"] is not None else None,
+            sigma_fondo=valores["sigma_fondo"], tipo_kernel=valores["tipo_kernel"],
+            modo_correccion=valores["modo_correccion"], radio_bola=valores["radio_bola"],
+            radio_tophat=valores["radio_tophat"], gamma_bajo=valores["gamma_bajo"],
+            gamma_alto=valores["gamma_alto"], corte=valores["corte"],
+            conservar_nivel=valores["conservar_nivel"],
+        )
+
+        corregidas = []
+        filas = []
+        lineas = []
+        region_fila, etiqueta = region_y_etiqueta(valores["modo"], valores["roi"])
+        for nombre_caso, valor in barrido:
+            argumentos = dict(comunes)
+            argumentos[parametro] = valor
+            corregida, _ = corregir_fondo(region, metodo=metodo, **argumentos)
+            corregidas.append((nombre_caso, valor, corregida))
+
+            nombre_capa = f"{imagen.name}_{clave_csv(metodo)}_{clave_csv(nombre_caso)}"
+            agregar_o_actualizar_capa(
+                nombre_capa, corregida, colormap="gray",
+                translate=tuple(origen_region),
+                visible=(nombre_caso == "Corrección adecuada"),
+            )
+            despues = medidas_fondo(
+                corregida, rois_en_arreglo(corregida, origen_region, valores["roi"])
+            )
+            lineas.append(
+                f"{nombre_caso} ({parametro} = {valor:g}) → capa {nombre_capa}\n"
+                + "\n".join(
+                    f"    {clave}: {formatear_valor(antes[clave])} → "
+                    f"{formatear_valor(despues.get(clave, float('nan')))}"
+                    for clave in antes
+                )
+            )
+            filas.append(crear_registro(
+                imagen=imagen.name,
+                actividad="5 - Corrección de fondo",
+                region=region_fila,
+                etiqueta_roi=etiqueta,
+                metodo=metodo,
+                parametros={parametro: valor, "factor_barrido": factor},
+                metrica_antes=antes,
+                metrica_despues=despues,
+                resultados={"capa_resultado": nombre_capa},
+                observaciones=f"barrido: {nombre_caso.lower()}",
+            ))
+
+        if valores["registrar"]:
+            agregar_pendientes(filas)
+        if valores["ver_figura"]:
+            nombre_fig = f"Barrido de fondo: {imagen.name} - {metodo}"
+            mostrar_figura(
+                figura_barrido(nombre_fig, region, corregidas, parametro), nombre_fig
+            )
+
+        informe.value = (
+            "INFORME - BARRIDO DE CORRECCIÓN DE FONDO (Act. 5)\n"
+            f"Capa: {imagen.name}   Región: {descripcion} "
+            f"({region.shape[0]}x{region.shape[1]})\n"
+            f"Método: {metodo}   Parámetro barrido: {parametro} "
+            f"(x1/{factor:g}, x1, x{factor:g})\n\n"
+            + "\n\n".join(lineas)
+            + (f"\n\n{len(filas)} filas agregadas al CSV pendiente."
+               if valores["registrar"] else "")
+        )
+    except Exception as error:
+        informe.value = f"INFORME\nNo se pudo hacer el barrido:\n{error}"
+
+
+def actualizar_parametros_fondo(event=None):
+    """Muestra solo los parámetros del método de fondo elegido."""
+    visibles = PARAMETROS_FONDO[widget_fondo.metodo.value]
+    for nombre in TODOS_PARAMETROS_FONDO:
+        getattr(widget_fondo, nombre).visible = nombre in visibles
+    widget_fondo.factor_barrido.visible = (
+        widget_fondo.metodo.value in PARAMETRO_BARRIDO
+    )
+
+
+widget_fondo.metodo.changed.connect(actualizar_parametros_fondo)
+
+
+# ============================================================
+# 6.7 REALCE (Actividad 6)
+#     Transformaciones de intensidad y filtros de realce, con los
+#     valores que permiten ver si se amplificó ruido o se perdió
+#     información (la lectura queda para el informe).
+# ============================================================
+
+PARAMETROS_REALCE = {
+    "Gamma": ["gamma"],
+    "Logarítmica": ["factor_log"],
+    "Sigmoidal": ["centro", "ganancia"],
+    "CLAHE": ["tamano_mosaico", "limite_contraste"],
+    "Pasa-altos": ["sigma_altos", "conservar_nivel"],
+    "Pasa-banda": ["sigma_bajo", "sigma_alto", "conservar_nivel"],
+    "Unsharp masking": ["sigma_unsharp", "cantidad", "umbral"],
+}
+TODOS_PARAMETROS_REALCE = sorted(
+    {n for v in PARAMETROS_REALCE.values() for n in v}
+)
+
+
+def figura_realce(nombre, original, realzada, limites):
+    """Original, realzada, histogramas y curva de transformación."""
+    fig = Figure(figsize=(12, 9), layout="constrained")
+    ejes = fig.subplots(2, 2)
+
+    ax = ejes[0, 0]
+    ax.imshow(original, cmap="gray", vmin=limites[0], vmax=limites[1])
+    ax.set_title("Original")
+
+    ax = ejes[0, 1]
+    ax.imshow(realzada, cmap="gray")
+    ax.set_title("Realzada (contraste propio)")
+
+    for ax in (ejes[0, 0], ejes[0, 1]):
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    ax = ejes[1, 0]
+    ax.hist(original.ravel(), bins=128, density=True, color="0.6",
+            histtype="step", label="original")
+    ax.hist(realzada.ravel(), bins=128, density=True, color="tab:red",
+            histtype="step", label="realzada")
+    ax.set_yscale("log")
+    ax.set_title("Histogramas")
+    ax.set_xlabel("intensidad")
+    ax.legend(fontsize=7)
+
+    # Relación entrada-salida: para las transformaciones puntuales es la
+    # curva del método; para los filtros muestra cuánta dispersión agrega.
+    ax = ejes[1, 1]
+    muestra = np.random.default_rng(0).choice(original.size, size=min(20000, original.size),
+                                              replace=False)
+    ax.plot(original.ravel()[muestra], realzada.ravel()[muestra], ".",
+            markersize=1, alpha=0.3)
+    ax.set_xlabel("intensidad original")
+    ax.set_ylabel("intensidad realzada")
+    ax.set_title("Entrada vs. salida")
+
+    fig.suptitle(nombre)
+    return fig
+
+
+@magicgui(
+    call_button="Aplicar realce",
+    metodo={"choices": METODOS_REALCE, "label": "Método"},
+    modo={
+        "choices": ["Imagen completa", "ROI seleccionada"],
+        "label": "Región a realzar",
+    },
+    excluir_marco={"label": "Quitar marco uniforme"},
+    gamma={"label": "γ", "min": 0.05, "max": 5.0, "step": 0.05},
+    factor_log={"label": "Factor del log", "min": 0.1, "max": 500.0, "step": 1.0},
+    centro={"label": "Centro (frac. del rango)", "min": 0.0, "max": 1.0, "step": 0.05},
+    ganancia={"label": "Ganancia (pendiente)", "min": 0.5, "max": 50.0, "step": 0.5},
+    tamano_mosaico={"label": "Mosaico CLAHE (px)", "min": 3, "max": 512},
+    limite_contraste={"label": "Límite de contraste", "min": 0.001, "max": 1.0, "step": 0.005},
+    sigma_altos={"label": "σ del pasa-altos (px)", "min": 0.5, "max": 100.0, "step": 0.5},
+    sigma_bajo={"label": "σ bajo (px)", "min": 0.3, "max": 50.0, "step": 0.1},
+    sigma_alto={"label": "σ alto (px)", "min": 0.5, "max": 200.0, "step": 0.5},
+    sigma_unsharp={"label": "σ del unsharp (px)", "min": 0.3, "max": 50.0, "step": 0.1},
+    cantidad={"label": "Cantidad", "min": 0.1, "max": 10.0, "step": 0.1},
+    umbral={"label": "Umbral de detalle", "min": 0.0, "max": 100.0, "step": 0.5},
+    conservar_nivel={"label": "Conservar nivel medio"},
+    ver_figura={"label": "Mostrar figura"},
+    registrar={"label": "Agregar al CSV"},
+)
+def widget_realce(
+    imagen: Image,
+    metodo: str = "CLAHE",
+    modo: str = "Imagen completa",
+    roi: Shapes = None,
+    excluir_marco: bool = True,
+    gamma: float = 0.7,
+    factor_log: float = 10.0,
+    centro: float = 0.5,
+    ganancia: float = 10.0,
+    tamano_mosaico: int = 64,
+    limite_contraste: float = 0.01,
+    sigma_altos: float = 3.0,
+    sigma_bajo: float = 1.0,
+    sigma_alto: float = 8.0,
+    sigma_unsharp: float = 2.0,
+    cantidad: float = 1.0,
+    umbral: float = 0.0,
+    conservar_nivel: bool = True,
+    ver_figura: bool = True,
+    registrar: bool = True,
+):
+    if imagen is None:
+        informe.value = "INFORME\nSeleccioná una capa Image."
+        return
+
+    try:
+        region, origen_region, descripcion = region_en_gris(
+            imagen, modo, roi, excluir_marco
+        )
+        rois_antes = rois_en_arreglo(region, origen_region, roi)
+
+        todos = dict(
+            gamma=gamma, factor_log=factor_log, centro=centro, ganancia=ganancia,
+            tamano_mosaico=tamano_mosaico, limite_contraste=limite_contraste,
+            sigma_altos=sigma_altos, sigma_bajo=sigma_bajo, sigma_alto=sigma_alto,
+            sigma_unsharp=sigma_unsharp, cantidad=cantidad, umbral=umbral,
+            conservar_nivel=conservar_nivel,
+        )
+        parametros = {k: todos[k] for k in PARAMETROS_REALCE[metodo]}
+
+        inicio = datetime.now()
+        realzada = realzar(region, metodo=metodo, **todos)
+        segundos = (datetime.now() - inicio).total_seconds()
+
+        nombre_capa = f"{imagen.name}_{clave_csv(metodo)}"
+        capa = agregar_o_actualizar_capa(
+            nombre_capa, realzada, colormap="gray",
+            translate=tuple(origen_region),
+        )
+        viewer.layers.selection.active = capa
+
+        limites = (float(region.min()), float(region.max()))
+        antes = medidas_realce(region, rois_antes, limites)
+        despues = medidas_realce(
+            realzada, rois_en_arreglo(realzada, origen_region, roi), limites
+        )
+        razones = comparar_realce(region, realzada)
+
+        if ver_figura:
+            nombre_fig = f"Realce: {imagen.name} - {metodo}"
+            fig = figura_realce(
+                f"{nombre_fig} ({formatear_resultados(parametros)})",
+                region, realzada, limites,
+            )
+            mostrar_figura(fig, nombre_fig)
+
+        region_fila, etiqueta = region_y_etiqueta(modo, roi)
+        if registrar:
+            agregar_pendientes([crear_registro(
+                imagen=imagen.name,
+                actividad="6 - Realce",
+                region=region_fila,
+                etiqueta_roi=etiqueta,
+                metodo=metodo,
+                parametros=parametros,
+                metrica_antes=antes,
+                metrica_despues=despues,
+                resultados={**razones, "tiempo_s": segundos,
+                            "capa_resultado": nombre_capa},
+            )])
+
+        informe.value = (
+            "INFORME - REALCE (Act. 6)\n"
+            f"Capa: {imagen.name}   Región: {descripcion} "
+            f"({region.shape[0]}x{region.shape[1]})\n"
+            f"Método: {metodo}\n"
+            "Parámetros: " + formatear_resultados(parametros) + "\n"
+            f"Tiempo: {segundos:.2f} s   Capa creada: {nombre_capa}\n\n"
+            "ANTES → DESPUÉS\n"
+            + "\n".join(
+                f"  {clave}: {formatear_valor(antes[clave])} → "
+                f"{formatear_valor(despues.get(clave, float('nan')))}"
+                for clave in antes
+            )
+            + "\n\nRAZONES DESPUÉS/ANTES\n"
+            + "\n".join(
+                f"  {clave} = {formatear_valor(valor)}"
+                for clave, valor in razones.items()
+            )
+            + ("\n\nFila agregada al CSV pendiente." if registrar else "")
+        )
+    except Exception as error:
+        informe.value = f"INFORME\nNo se pudo realzar:\n{error}"
+
+
+def actualizar_parametros_realce(event=None):
+    """Muestra solo los parámetros del método de realce elegido."""
+    visibles = PARAMETROS_REALCE[widget_realce.metodo.value]
+    for nombre in TODOS_PARAMETROS_REALCE:
+        getattr(widget_realce, nombre).visible = nombre in visibles
+
+
+widget_realce.metodo.changed.connect(actualizar_parametros_realce)
+
+
+# ============================================================
+# 6.8 EVALUACIÓN (Actividad 7)
+#     Métricas sin referencia (SNR, CNR, uniformidad) sobre las ROIs y,
+#     si se elige una capa de referencia, también MSE / PSNR / SSIM.
+# ============================================================
+
+def figura_metricas(nombre, imagen, referencia, mapa_ssim, sin_referencia):
+    """Imagen (y referencia), diferencia, mapa SSIM y barras de SNR/CNR."""
+    fig = Figure(figsize=(12, 9), layout="constrained")
+    ejes = fig.subplots(2, 2)
+    vmin, vmax = np.percentile(imagen, [0.5, 99.5])
+
+    ax = ejes[0, 0]
+    ax.imshow(imagen, cmap="gray", vmin=vmin, vmax=vmax)
+    ax.set_title("Imagen evaluada")
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    ax = ejes[0, 1]
+    if referencia is not None:
+        ax.imshow(referencia, cmap="gray", vmin=vmin, vmax=vmax)
+        ax.set_title("Referencia")
+        ax.set_xticks([])
+        ax.set_yticks([])
+    else:
+        ax.hist(imagen.ravel(), bins=128, color="0.5")
+        ax.set_yscale("log")
+        ax.set_title("Histograma de la imagen evaluada")
+
+    ax = ejes[1, 0]
+    if referencia is not None:
+        diferencia = imagen - referencia
+        lim = max(np.percentile(np.abs(diferencia), 99), 1e-9)
+        im = ax.imshow(diferencia, cmap="gray", vmin=-lim, vmax=lim)
+        fig.colorbar(im, ax=ax, shrink=0.8)
+        ax.set_title("Diferencia (evaluada - referencia)")
+        ax.set_xticks([])
+        ax.set_yticks([])
+    else:
+        ax.axis("off")
+
+    ax = ejes[1, 1]
+    if mapa_ssim is not None:
+        im = ax.imshow(mapa_ssim, cmap="viridis", vmin=0, vmax=1)
+        fig.colorbar(im, ax=ax, shrink=0.8)
+        ax.set_title("Mapa SSIM (1 = igual a la referencia)")
+        ax.set_xticks([])
+        ax.set_yticks([])
+    else:
+        claves = [
+            c for c in sin_referencia
+            if c.startswith(("snr_roi", "cnr_roi", "uniformidad_roi"))
+        ]
+        if claves:
+            valores = [sin_referencia[c] for c in claves]
+            ax.barh(range(len(claves)), valores, color="0.5")
+            ax.set_yticks(range(len(claves)))
+            ax.set_yticklabels(claves, fontsize=7)
+            ax.invert_yaxis()
+            ax.set_title("Métricas por ROI")
+        else:
+            ax.text(0.5, 0.5, "Dibujá ROIs para calcular\nSNR, CNR y uniformidad",
+                    ha="center", va="center")
+            ax.axis("off")
+
+    fig.suptitle(nombre)
+    return fig
+
+
+@magicgui(
+    call_button="Calcular métricas",
+    modo={
+        "choices": ["Imagen completa", "ROI seleccionada"],
+        "label": "Región a evaluar",
+    },
+    excluir_marco={"label": "Quitar marco uniforme"},
+    referencia={"label": "Referencia (opcional)"},
+    ver_figura={"label": "Mostrar figura"},
+    registrar={"label": "Agregar al CSV"},
+)
+def widget_metricas(
+    imagen: Image,
+    referencia: Image = None,
+    modo: str = "Imagen completa",
+    roi: Shapes = None,
+    excluir_marco: bool = True,
+    ver_figura: bool = True,
+    registrar: bool = True,
+):
+    if imagen is None:
+        informe.value = "INFORME\nSeleccioná una capa Image."
+        return
+
+    try:
+        region, origen_region, descripcion = region_en_gris(
+            imagen, modo, roi, excluir_marco
+        )
+        lista_rois = rois_en_arreglo(region, origen_region, roi)
+
+        # Misma región en la referencia (se alinea por las coordenadas del mundo)
+        region_referencia = None
+        if referencia is not None:
+            if referencia is imagen:
+                raise ValueError("La referencia es la misma capa que la evaluada.")
+            gris_referencia = a_escala_de_grises(referencia.data)
+            f0, c0 = np.round(origen_region - origen_capa(referencia)).astype(int)
+            alto, ancho = region.shape
+            if (
+                f0 < 0 or c0 < 0
+                or f0 + alto > gris_referencia.shape[0]
+                or c0 + ancho > gris_referencia.shape[1]
+            ):
+                raise ValueError(
+                    f"La región no entra en la referencia '{referencia.name}' "
+                    f"({gris_referencia.shape})."
+                )
+            region_referencia = gris_referencia[f0:f0 + alto, c0:c0 + ancho]
+
+        # El rango dinámico sale de la REFERENCIA: así el PSNR y el SSIM
+        # de distintas versiones procesadas son comparables entre sí.
+        sin_referencia, con_referencia, mapa = evaluar(
+            region,
+            referencia=region_referencia,
+            lista_rois=lista_rois,
+            rango_datos=escala_intensidad(
+                referencia.data if referencia is not None else imagen.data
+            ),
+        )
+
+        if ver_figura:
+            nombre_fig = f"Métricas: {imagen.name}"
+            fig = figura_metricas(
+                nombre_fig + (f" vs {referencia.name}" if referencia else ""),
+                region, region_referencia, mapa, sin_referencia,
+            )
+            mostrar_figura(fig, nombre_fig)
+
+        region_fila, etiqueta = region_y_etiqueta(modo, roi)
+        if registrar:
+            metricas_referencia = {}
+            if region_referencia is not None:
+                metricas_referencia = metricas_sin_referencia(
+                    region_referencia,
+                    rois_en_arreglo(region_referencia, origen_region, roi),
+                )
+            agregar_pendientes([crear_registro(
+                imagen=imagen.name,
+                actividad="7 - Evaluación",
+                region=region_fila,
+                etiqueta_roi=etiqueta,
+                metodo=(
+                    f"Con y sin referencia (vs {referencia.name})"
+                    if referencia is not None else "Sin referencia"
+                ),
+                parametros={"sin_marco": excluir_marco,
+                            "rois": len(lista_rois)},
+                metrica_antes=metricas_referencia,
+                metrica_despues=sin_referencia,
+                resultados=con_referencia,
+            )])
+
+        informe.value = (
+            "INFORME - EVALUACIÓN (Act. 7)\n"
+            f"Capa: {imagen.name}   Región: {descripcion} "
+            f"({region.shape[0]}x{region.shape[1]})\n"
+            f"ROIs usadas: {len(lista_rois)}\n\n"
+            "SIN REFERENCIA\n"
+            + "\n".join(
+                f"  {clave} = {formatear_valor(valor)}"
+                for clave, valor in sin_referencia.items()
+            )
+            + (
+                f"\n\nCON REFERENCIA (vs {referencia.name})\n"
+                + "\n".join(
+                    f"  {clave} = {formatear_valor(valor)}"
+                    for clave, valor in con_referencia.items()
+                )
+                if con_referencia else
+                "\n\n(Sin capa de referencia: solo métricas sin referencia.)"
+            )
+            + ("\n\nFila agregada al CSV pendiente." if registrar else "")
+        )
+    except Exception as error:
+        informe.value = f"INFORME\nNo se pudieron calcular las métricas:\n{error}"
+
+
+# ============================================================
 # 7. REGISTRO DEL PIPELINE (Actividad 7 - documentación)
 #    Carga un paso (diagnóstico/método/parámetros/métricas) al mismo CSV
 #    que las mediciones. Los campos los completa el usuario (la hipótesis
@@ -2603,6 +4762,19 @@ panel = Container(
         titulo("Actividad 3 - Reducción de ruido"),
         boton_usar_sigma,
         widget_filtro,
+        titulo("Actividad 4 - Restauración (deconvolución)"),
+        boton_nsr,
+        widget_deconvolucion,
+        titulo("Actividad 4 - Artefactos periódicos (notch)"),
+        boton_detectar_picos,
+        widget_notch,
+        titulo("Actividad 5 - Corrección de fondo"),
+        widget_fondo,
+        boton_barrido_fondo,
+        titulo("Actividad 6 - Realce"),
+        widget_realce,
+        titulo("Actividad 7 - Evaluación (métricas)"),
+        widget_metricas,
         titulo("Registro del pipeline"),
         widget_pipeline,
         titulo("Archivo CSV"),
@@ -2641,6 +4813,9 @@ viewer.layers.events.removed.connect(panel.reset_choices)
 viewer.layers.events.moved.connect(panel.reset_choices)
 panel.reset_choices()
 actualizar_parametros_filtro()
+actualizar_parametros_deconv()
+actualizar_parametros_fondo()
+actualizar_parametros_realce()
 
 
 # ============================================================
