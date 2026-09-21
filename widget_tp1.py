@@ -25,7 +25,7 @@
 #        Act. 2  estimar_ruido()       ROI homogénea, múltiples ROIs,
 #                                      MAD, adquisiciones, dif. locales,
 #                                      coeficientes wavelet
-#        Act. 3  reducir_ruido()       gaussiano, bilateral, difusión
+#        Act. 3  reducir_ruido()       mediana, gaussiano, bilateral, difusión
 #                                      anisotrópica, NLM, TV, wavelet,
 #                                      Wiener local, BM3D
 #        Act. 4  restaurar()           deconvolución Wiener / RL con PSF
@@ -877,7 +877,7 @@ def estimar_ruido(
 
 # ------------------------------------------------------------
 # Actividad 3 - Reducción de ruido
-# (gaussiano, bilateral, difusión anisotrópica, NLM, TV,
+# (mediana, gaussiano, bilateral, difusión anisotrópica, NLM, TV,
 #  wavelet thresholding, Wiener local, BM3D)
 # ------------------------------------------------------------
 #
@@ -887,6 +887,7 @@ def estimar_ruido(
 # se normaliza a [0, 1] para las funciones que lo necesitan.
 
 METODOS_FILTRO = [
+    "Mediana",
     "Gaussiano",
     "Bilateral",
     "Difusión anisotrópica",
@@ -896,6 +897,32 @@ METODOS_FILTRO = [
     "Wiener local",
     "BM3D",
 ]
+
+
+def filtro_mediana(img, ventana=3, forma="Cuadrada", umbral_impulso=0.0):
+    """
+    Mediana en una ventana de `ventana` x `ventana` px (impar). Es el filtro
+    indicado para ruido impulsivo (sal y pimienta): un píxel aislado a 0 o
+    255 no mueve la mediana del vecindario, en cambio arrastraría un promedio.
+      forma "Disco": vecindario circular inscripto en la ventana (menos
+        distorsión de esquinas y bordes diagonales).
+      umbral_impulso > 0: mediana CONMUTADA; solo se reemplazan los píxeles
+        que se apartan de la mediana local más que ese valor (intensidad).
+        El resto queda intacto, así se conserva el detalle fino.
+    """
+    ventana = int(ventana)
+    if ventana < 3 or ventana % 2 == 0:
+        raise ValueError("La ventana de la mediana debe ser impar y >= 3.")
+
+    img = np.asarray(img, dtype=float)
+    if forma == "Disco":
+        mediana = ndi.median_filter(img, footprint=disk(ventana // 2))
+    else:
+        mediana = ndi.median_filter(img, size=ventana)
+
+    if umbral_impulso > 0:
+        return np.where(np.abs(img - mediana) > umbral_impulso, mediana, img)
+    return mediana
 
 
 def filtro_gaussiano(img, sigma_espacial=1.0):
@@ -1041,6 +1068,10 @@ def reducir_ruido(imagen, metodo="Gaussiano", escala=255.0, **p):
     """
     img = a_escala_de_grises(imagen)
 
+    if metodo == "Mediana":
+        return filtro_mediana(
+            img, p["ventana_mediana"], p["forma_mediana"], p["umbral_impulso"]
+        )
     if metodo == "Gaussiano":
         return filtro_gaussiano(img, p["sigma_espacial"])
     if metodo == "Bilateral":
@@ -3056,6 +3087,7 @@ def widget_ruido(
 
 # Parámetros que usa cada método (el resto se oculta en el panel)
 PARAMETROS_FILTRO = {
+    "Mediana": ["ventana_mediana", "forma_mediana", "umbral_impulso"],
     "Gaussiano": ["sigma_espacial"],
     "Bilateral": ["sigma_color", "sigma_espacial"],
     "Difusión anisotrópica": ["iteraciones", "kappa", "gamma", "funcion_conduccion"],
@@ -3162,6 +3194,11 @@ def copiar_ultimo_sigma():
     modo_umbral={"choices": ["soft", "hard"], "label": "Umbralado"},
     niveles_wavelet={"label": "Niveles (0 = auto)", "min": 0, "max": 8},
     ventana={"label": "Ventana (px)", "min": 3, "max": 31, "step": 2},
+    ventana_mediana={"label": "Ventana de la mediana (px)", "min": 3, "max": 31, "step": 2},
+    forma_mediana={"choices": ["Cuadrada", "Disco"], "label": "Forma de la ventana"},
+    umbral_impulso={
+        "label": "Umbral de impulso (0 = todos)", "min": 0.0, "max": 255.0, "step": 1.0,
+    },
     etapas_bm3d={
         "choices": ["Completo (2 etapas)", "Solo umbral duro (1 etapa)"],
         "label": "Etapas BM3D",
@@ -3192,6 +3229,9 @@ def widget_filtro(
     modo_umbral: str = "soft",
     niveles_wavelet: int = 0,
     ventana: int = 5,
+    ventana_mediana: int = 3,
+    forma_mediana: str = "Cuadrada",
+    umbral_impulso: float = 0.0,
     etapas_bm3d: str = "Completo (2 etapas)",
     agregar_residuo: bool = False,
     ver_figura: bool = True,
@@ -3214,7 +3254,9 @@ def widget_filtro(
             tamano_parche=tamano_parche, distancia_busqueda=distancia_busqueda,
             peso_tv=peso_tv, wavelet=wavelet, umbral=umbral,
             modo_umbral=modo_umbral, niveles_wavelet=niveles_wavelet,
-            ventana=ventana, etapas_bm3d=etapas_bm3d,
+            ventana=ventana, ventana_mediana=ventana_mediana,
+            forma_mediana=forma_mediana, umbral_impulso=umbral_impulso,
+            etapas_bm3d=etapas_bm3d,
         )
         parametros = {k: todos[k] for k in PARAMETROS_FILTRO[metodo]}
 
