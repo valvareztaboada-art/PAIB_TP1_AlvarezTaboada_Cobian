@@ -3149,6 +3149,33 @@ def figura_filtro(nombre, original, filtrada):
     return fig
 
 
+def medidas_filtrado(region, filtrada, origen_region, roi):
+    """
+    σ wavelet antes/después y, si hay una ROI seleccionada que cae entera
+    dentro de la región, su media y desvío antes/después.
+    Devuelve (antes, despues, nombre_de_la_roi_medida).
+    """
+    antes = {"sigma_wavelet": descomposicion_wavelet(region, "db2", 1)["sigma_donoho"]}
+    despues = {"sigma_wavelet": descomposicion_wavelet(filtrada, "db2", 1)["sigma_donoho"]}
+
+    try:
+        indice = obtener_indice_roi_seleccionada(roi)
+    except ValueError:
+        return antes, despues, ""
+
+    en_region = [i for i, _ in rois_en_arreglo(region, origen_region, roi)]
+    if indice not in en_region:
+        return antes, despues, ""
+
+    datos_antes = dict(rois_en_arreglo(region, origen_region, roi))[indice]
+    datos_despues = dict(rois_en_arreglo(filtrada, origen_region, roi))[indice]
+    antes.update(media_roi=float(datos_antes.mean()),
+                 desvio_roi=float(datos_antes.std(ddof=1)))
+    despues.update(media_roi=float(datos_despues.mean()),
+                   desvio_roi=float(datos_despues.std(ddof=1)))
+    return antes, despues, nombre_roi(roi, indice)
+
+
 boton_usar_sigma = PushButton(text="Copiar σ de la última estimación (Act. 2)")
 
 
@@ -3204,6 +3231,7 @@ def copiar_ultimo_sigma():
         "label": "Etapas BM3D",
     },
     agregar_residuo={"label": "Agregar capa de residuo"},
+    factor_barrido={"label": "Factor del barrido", "min": 1.1, "max": 10.0, "step": 0.1},
     ver_figura={"label": "Mostrar figura comparativa"},
     registrar={"label": "Agregar al CSV"},
 )
@@ -3234,6 +3262,7 @@ def widget_filtro(
     umbral_impulso: float = 0.0,
     etapas_bm3d: str = "Completo (2 etapas)",
     agregar_residuo: bool = False,
+    factor_barrido: float = 2.0,
     ver_figura: bool = True,
     registrar: bool = True,
 ):
@@ -3282,30 +3311,8 @@ def widget_filtro(
         viewer.layers.selection.active = capa
 
         # --- Valores antes / después (sin interpretar)
-        antes = {"sigma_wavelet": descomposicion_wavelet(region, "db2", 1)["sigma_donoho"]}
-        despues = {"sigma_wavelet": descomposicion_wavelet(filtrada, "db2", 1)["sigma_donoho"]}
-
-        # σ en la ROI seleccionada (si hay una y cae dentro de la región)
         region_fila, etiqueta = region_y_etiqueta(modo, roi)
-        roi_medida = ""
-        try:
-            indice = obtener_indice_roi_seleccionada(roi)
-            gris = a_escala_de_grises(imagen.data)
-            origen = origen_capa(imagen)
-            filtrada_completa = gris.copy()
-            f0, c0 = np.round(origen_region - origen).astype(int)
-            filtrada_completa[f0:f0 + region.shape[0], c0:c0 + region.shape[1]] = filtrada
-            en_region = np.zeros(gris.shape, dtype=bool)
-            en_region[f0:f0 + region.shape[0], c0:c0 + region.shape[1]] = True
-            mascara = obtener_datos_roi(en_region.astype(float), roi, indice, origen)
-            if mascara.size >= 2 and mascara.all():
-                datos_antes = obtener_datos_roi(gris, roi, indice, origen)
-                datos_despues = obtener_datos_roi(filtrada_completa, roi, indice, origen)
-                antes.update(media_roi=datos_antes.mean(), desvio_roi=datos_antes.std(ddof=1))
-                despues.update(media_roi=datos_despues.mean(), desvio_roi=datos_despues.std(ddof=1))
-                roi_medida = nombre_roi(roi, indice)
-        except ValueError:
-            pass
+        antes, despues, roi_medida = medidas_filtrado(region, filtrada, origen_region, roi)
 
         resultados = {
             "tiempo_s": segundos,
@@ -3369,6 +3376,215 @@ def actualizar_parametros_filtro(event=None):
 
 
 widget_filtro.metodo.changed.connect(actualizar_parametros_filtro)
+
+
+# ------------------------------------------------------------
+# Barrido: subfiltrado / filtrado adecuado / sobrefiltrado
+# ------------------------------------------------------------
+
+# Parámetro que regula la FUERZA de cada filtro (más grande = filtra más).
+# Los que son ventanas se redondean al impar más cercano.
+PARAMETRO_BARRIDO_FILTRO = {
+    "Mediana": "ventana_mediana",
+    "Gaussiano": "sigma_espacial",
+    "Bilateral": "sigma_color",
+    "Difusión anisotrópica": "kappa",
+    "Non-Local Means": "h",
+    "Variación Total": "peso_tv",
+    "Wavelet thresholding": "sigma_ruido",
+    "Wiener local": "ventana",
+    "BM3D": "sigma_ruido",
+}
+PARAMETROS_VENTANA = {"ventana_mediana", "ventana"}
+
+
+def valores_barrido(valor, factor, es_ventana=False):
+    """(menor, valor, mayor) = (valor/factor, valor, valor·factor)."""
+    if not es_ventana:
+        return valor / factor, valor, valor * factor
+
+    def impar(x):
+        n = max(3, int(round(x)))
+        return n if n % 2 == 1 else n + 1
+
+    # Ventanas: impares y distintas entre sí (salvo que la base ya sea 3,
+    # que es la ventana más chica posible).
+    valor = impar(valor)
+    menor = impar(valor / factor)
+    if menor >= valor:
+        menor = max(3, valor - 2)
+    mayor = impar(valor * factor)
+    if mayor <= valor:
+        mayor = valor + 2
+    return menor, valor, mayor
+
+
+def figura_barrido_filtro(nombre, original, filtradas, parametro):
+    """
+    Fila de arriba: original y las tres filtradas (misma escala de grises).
+    Fila de abajo: perfil central y los residuos (lo que quitó cada una).
+    `filtradas` es [(etiqueta, valor, imagen), ...].
+    """
+    fig = Figure(figsize=(18, 9), layout="constrained")
+    ejes = fig.subplots(2, 4)
+    vmin, vmax = np.percentile(original, [0.5, 99.5])
+
+    ejes[0, 0].imshow(original, cmap="gray", vmin=vmin, vmax=vmax)
+    ejes[0, 0].set_title("Original")
+
+    residuos = [original - imagen for _, _, imagen in filtradas]
+    lim = max(max(np.percentile(np.abs(r), 99) for r in residuos), 1e-9)
+    for k, (etiqueta, valor, imagen) in enumerate(filtradas):
+        ax = ejes[0, k + 1]
+        ax.imshow(imagen, cmap="gray", vmin=vmin, vmax=vmax)
+        ax.set_title(f"{etiqueta} ({parametro} = {valor:g})")
+        ax = ejes[1, k + 1]
+        ax.imshow(residuos[k], cmap="gray", vmin=-lim, vmax=lim)
+        ax.set_title(f"Residuo: {etiqueta.lower()}")
+
+    for ax in list(ejes[0]) + list(ejes[1, 1:]):
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+    ax = ejes[1, 0]
+    fila = original.shape[0] // 2
+    ax.plot(original[fila], color="0.6", linewidth=0.8, label="original")
+    for etiqueta, valor, imagen in filtradas:
+        ax.plot(imagen[fila], linewidth=1.0, label=f"{etiqueta} ({valor:g})")
+    ax.set_xlabel("columna (px)")
+    ax.set_title(f"Perfil horizontal (fila central {fila})")
+    ax.legend(fontsize=7)
+
+    fig.suptitle(nombre + "  -  residuos en la misma escala")
+    return fig
+
+
+boton_barrido_filtro = PushButton(text="Crear sub / adecuado / sobrefiltrado")
+
+
+@boton_barrido_filtro.clicked.connect
+def barrido_filtro():
+    """
+    Aplica el filtro tres veces: con el parámetro de fuerza del panel y
+    con ese parámetro dividido y multiplicado por el factor. Crea las tres
+    capas, una figura comparativa y tres filas del CSV.
+    """
+    try:
+        valores = widget_filtro.asdict()
+        metodo = valores["metodo"]
+        imagen = valores["imagen"]
+        if imagen is None:
+            raise ValueError("Elegí la capa en el bloque de reducción de ruido.")
+
+        parametro = PARAMETRO_BARRIDO_FILTRO[metodo]
+        base = valores[parametro]
+        if base <= 0:
+            raise ValueError(
+                f"Para barrer '{parametro}' hace falta un valor > 0 "
+                "(con 0 el método lo estima solo y no hay nada que escalar)."
+            )
+        menor, base, mayor = valores_barrido(
+            base, valores["factor_barrido"], parametro in PARAMETROS_VENTANA
+        )
+        barrido = [
+            ("Subfiltrado", menor),
+            ("Filtrado adecuado", base),
+            ("Sobrefiltrado", mayor),
+        ]
+
+        roi = valores["roi"]
+        region, origen_region, descripcion = region_en_gris(
+            imagen, valores["modo"], roi, valores["excluir_marco"]
+        )
+        escala = escala_intensidad(imagen.data)
+        todos = {k: valores[k] for k in TODOS_PARAMETROS_FILTRO}
+        region_fila, etiqueta = region_y_etiqueta(valores["modo"], roi)
+
+        filtradas, filas, lineas = [], [], []
+        for nombre_caso, valor in barrido:
+            argumentos = dict(todos)
+            argumentos[parametro] = valor
+            filtrada = reducir_ruido(region, metodo, escala=escala, **argumentos)
+            filtradas.append((nombre_caso, valor, filtrada))
+
+            nombre_capa = (
+                f"{imagen.name}_{clave_csv(metodo)}_{clave_csv(nombre_caso)}"
+            )
+            agregar_o_actualizar_capa(
+                nombre_capa, filtrada, colormap="gray",
+                translate=tuple(origen_region),
+                contrast_limits=tuple(imagen.contrast_limits),
+                visible=(nombre_caso == "Filtrado adecuado"),
+            )
+
+            antes, despues, roi_medida = medidas_filtrado(
+                region, filtrada, origen_region, roi
+            )
+            residuo = region - filtrada
+            resultados = {
+                "residuo_media": float(residuo.mean()),
+                "residuo_desvio": float(residuo.std()),
+                "capa_resultado": nombre_capa,
+            }
+            if roi_medida:
+                resultados["roi_medida"] = roi_medida
+
+            parametros = {k: argumentos[k] for k in PARAMETROS_FILTRO[metodo]}
+            parametros["factor_barrido"] = valores["factor_barrido"]
+            usa_sigma = "sigma_ruido" in PARAMETROS_FILTRO[metodo]
+            filas.append(crear_registro(
+                imagen=imagen.name,
+                actividad="3 - Reducción de ruido",
+                region=region_fila,
+                etiqueta_roi=etiqueta,
+                metodo=metodo,
+                parametros=parametros,
+                estimacion_ruido=(
+                    argumentos["sigma_ruido"]
+                    if usa_sigma and argumentos["sigma_ruido"] > 0 else ""
+                ),
+                metrica_antes=antes,
+                metrica_despues=despues,
+                resultados=resultados,
+                observaciones=f"barrido: {nombre_caso.lower()}",
+            ))
+            lineas.append(
+                f"{nombre_caso} ({parametro} = {valor:g}) → capa {nombre_capa}\n"
+                + "\n".join(
+                    f"    {clave}: {formatear_valor(antes[clave])} → "
+                    f"{formatear_valor(despues[clave])}"
+                    for clave in antes
+                )
+                + f"\n    residuo_desvio = {residuo.std():.4f}"
+            )
+
+        if valores["registrar"]:
+            agregar_pendientes(filas)
+        if valores["ver_figura"]:
+            nombre_fig = f"Barrido de filtro: {imagen.name} - {metodo}"
+            mostrar_figura(
+                figura_barrido_filtro(nombre_fig, region, filtradas, parametro),
+                nombre_fig,
+            )
+
+        informe.value = (
+            "INFORME - BARRIDO DE REDUCCIÓN DE RUIDO (Act. 3)\n"
+            f"Capa: {imagen.name}   Región: {descripcion} "
+            f"({region.shape[0]}x{region.shape[1]})\n"
+            f"Filtro: {metodo}   Parámetro barrido: {parametro} "
+            f"(x1/{valores['factor_barrido']:g}, x1, x{valores['factor_barrido']:g})\n\n"
+            + "\n\n".join(lineas)
+            + (
+                f"\n\nNota: {parametro} = {base:g} ya es la ventana mínima, así "
+                "que el subfiltrado coincide con el filtrado adecuado. Para "
+                "comparar hacia abajo, subí la ventana base."
+                if menor == base else ""
+            )
+            + (f"\n\n{len(filas)} filas agregadas al CSV pendiente."
+               if valores["registrar"] else "")
+        )
+    except Exception as error:
+        informe.value = f"INFORME\nNo se pudo hacer el barrido:\n{error}"
 
 
 # ============================================================
@@ -4805,6 +5021,7 @@ panel = Container(
         titulo("Actividad 3 - Reducción de ruido"),
         boton_usar_sigma,
         widget_filtro,
+        boton_barrido_filtro,
         titulo("Actividad 4 - Restauración (deconvolución)"),
         boton_nsr,
         widget_deconvolucion,
