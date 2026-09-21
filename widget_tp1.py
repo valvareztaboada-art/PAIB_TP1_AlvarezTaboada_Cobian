@@ -4656,6 +4656,7 @@ def widget_metricas(
             "Fondo / inhomogeneidad",
             "Artefacto estructurado",
             "Desenfoque / pérdida de resolución",
+            "Sin degradación (referencia)",
         ],
         "label": "Diagnóstico (hipótesis)",
     },
