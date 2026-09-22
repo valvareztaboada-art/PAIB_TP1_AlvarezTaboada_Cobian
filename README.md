@@ -21,7 +21,7 @@ El widget abarca:
 
 - **Diagnóstico** de la imagen (histogramas, perfiles de intensidad, MAD, mapas de variabilidad local, diferencias entre píxeles, Fourier, autocorrelación y wavelet).
 - **Estimación de ruido** con seis estrategias (ROI homogénea con media observada o fija, múltiples ROIs, MAD, diferencias entre adquisiciones, diferencias locales y coeficientes wavelet), comparadas entre sí.
-- **Reducción de ruido** (gaussiano, bilateral, difusión anisotrópica, Non-Local Means, Variación Total, wavelet thresholding, Wiener local, BM3D).
+- **Reducción de ruido** (mediana, gaussiano, bilateral, difusión anisotrópica, Non-Local Means, Variación Total, wavelet thresholding, Wiener local, BM3D).
 - **Restauración y artefactos** (deconvolución de Wiener / Richardson–Lucy y filtros notch en el plano de Fourier).
 - **Corrección de fondo** (dark/flat-field, kernel de gran escala, rolling ball, white top-hat, corrección homomórfica), con un botón que genera de una vez subcorrección, corrección adecuada y sobrecorrección para compararlas.
 - **Realce** (transformación gamma, logarítmica, sigmoidal, CLAHE, pasa-altos/banda, unsharp masking), con medidas de amplificación de ruido, saturación y entropía.
@@ -78,9 +78,6 @@ pixi run python widget_tp1.py
 En napari: `File → Open File(s)…` para cargar una imagen de `data/` y usar el
 panel del TP para el análisis y procesamiento.
 
-> Si el entorno ya estaba creado de antes, volver a correr `pixi install` después
-> de traer cambios: el TP agregó la dependencia `bm3d`.
-
 ---
 
 ## Cómo se usa el panel
@@ -124,5 +121,5 @@ Un solo archivo acumulativo para todo el trabajo. Las filas se distinguen por:
 - Código organizado en funciones.
 - Entorno reproducible (`pixi.toml` / `pixi.lock`).
 - CSV de resultados (`resultados/`).
-- Imágenes obtenidas.
+- Imágenes obtenidas (`resultados/`).
 - Informe breve de análisis y justificación de las decisiones tomadas.
